@@ -1,0 +1,14 @@
+numpy
+pandas==2.2.2
+# Install torch to match your CUDA driver, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+torch>=2.0.0,<3.0.0
+
+einops==0.8.1
+huggingface_hub==0.33.1
+tqdm==4.67.1
+safetensors==0.6.2
+pyyaml
+
+# Binance data download
+python-binance
