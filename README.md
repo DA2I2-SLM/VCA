@@ -65,6 +65,10 @@ torchrun --standalone --nproc_per_node=4 finetune/train_predictor.py --arm A2 --
 
 **Fine-tune the cross-entropy-only baseline** (Method `A1`) the same way with `--arm A1`.
 
+**Fine-tune the MSE-AR ablation** (Method `A1-MSE`: cross-entropy + relative squared error of
+predicted vs. true close, `(p̂/p − 1)²`, on the same autoregressive rollout ACF² uses, instead of
+ACF²-matching) with `--arm A1-MSE`.
+
 **Evaluate the frozen backbone / a fine-tuned checkpoint** on the crypto universe:
 
 ```bash
@@ -109,7 +113,7 @@ the core method end-to-end on one dataset.
 |---|---|
 | **Model** | `NeoQuasar/Kronos-base` (predictor) + `NeoQuasar/Kronos-Tokenizer-base` |
 | **Universe** | 20 liquid Binance USDT spot pairs, 15-minute bars (`configs/crypto_top20.yaml`) |
-| **Methods** | `A1` (CE only), `A2` (CE + ACF² = VCA) |
+| **Methods** | `A1` (CE only), `A1-MSE` (CE + MSE-AR), `A2` (CE + ACF² = VCA) |
 | **Metrics** | Path-wise RankIC, $\sigma^2$-MAE and $\sigma^2$-MSE of realized variance (`eval/metrics.py`) |
 
 ---
@@ -129,7 +133,7 @@ VCA/
 │   └── download_binance.py  # public Binance REST downloader (no API key)
 ├── model/                    # Kronos tokenizer + predictor architecture
 ├── finetune/
-│   ├── config.py             # Phase2Config dataclass + arm_preset('A1'|'A2')
+│   ├── config.py             # Phase2Config dataclass + arm_preset('A1'|'A1-MSE'|'A2')
 │   ├── dataset.py            # strided-window dataset over the OHLCV CSVs
 │   ├── train_predictor.py    # training loop: CE + ACF² loss, DDP
 │   └── utils/training_utils.py

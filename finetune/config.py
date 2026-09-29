@@ -153,6 +153,13 @@ def arm_preset(arm: str = None, **overrides) -> Phase2Config:
     presets = {
         'A1': dict(lr=1e-4, arm='A1', run_name='A1_full', data_fraction=1.0),
         'A2': dict(lr=1e-4, arm='A2', run_name='A2_full', data_fraction=1.0),
+        # MSE-AR ablation: CE + λ·MSE(pred_close, true_close) on the same full
+        # autoregressive rollout ACF² uses, instead of ACF²-matching. Needs
+        # rollout_mode='full_ar' (the lambda_mse term is only wired into that
+        # path) and lambda_acf=0.0 so ACF² isn't also optimized.
+        'A1-MSE': dict(arm='A1-MSE', run_name='A1-MSE_full', data_fraction=1.0,
+                       rollout_mode='full_ar', batch_size=8, ar_val_select=True,
+                       gumbel_hard=True, lambda_acf=0.0, lambda_mse=200.0),
     }
     if arm is None:
         return sorted(presets)

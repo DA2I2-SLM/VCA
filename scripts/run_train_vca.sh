@@ -16,3 +16,4 @@ done
 
 echo "Checkpoints under \$SCRATCH/outputs/phase2/vca_s{42,44,46}/best_arval_agg_model"
 echo "Baseline (arm A1, CE-only) is produced the same way with --arm A1."
+echo "MSE-AR ablation (arm A1-MSE, CE + MSE on the AR rollout) with --arm A1-MSE."

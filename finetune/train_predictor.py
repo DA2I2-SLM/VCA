@@ -641,6 +641,7 @@ def eval_val_ar(
     pred_acf_all, true_acf_all = [], []
     pic_path_all, pric_path_all = [], []      # path-shape price IC / RankIC (Table 14)
     pred_ret_all, true_ret_all = [], []       # end-of-window return proxies (return IC/RankIC)
+    mse_rel_all = []                          # own val loss for the MSE-AR arm's checkpoint selection
     # single-element lists so the inner loop can accumulate without `nonlocal`
     n_roll_all, n_neg_all, n_s2gt1_all, s2_max_all = [0], [0], [0], [0.0]
 
@@ -685,6 +686,7 @@ def eval_val_ar(
                 pric_path_all.append(pric)
             pred_ret_all.append(float(pc[-1] / max(pc[0], 1e-16) - 1))
             true_ret_all.append(float(tc[-1] / max(tc[0], 1e-16) - 1))
+            mse_rel_all.append(float(np.mean((pc / np.maximum(tc, 1e-6) - 1.0) ** 2)))
 
     pred_acf_arr, true_acf_arr = np.array(pred_acf_all), np.array(true_acf_all)
     diff = pred_acf_arr - true_acf_arr
@@ -711,6 +713,7 @@ def eval_val_ar(
         'val_pct_neg_ar': 100.0 * n_neg_all[0] / max(n_roll_all[0], 1),
         'val_pct_s2gt1_ar': 100.0 * n_s2gt1_all[0] / max(n_roll_all[0], 1),
         'val_max_s2_ar': s2_max_all[0],
+        'mse_rel_ar': float(np.mean(mse_rel_all)) if mse_rel_all else float('nan'),
     }
 
 
@@ -768,6 +771,7 @@ def train(
     best_acf2_gap_ar = float('inf')    # AR val selection: autoregressive val acf2_gap (matches test)
     best_arval_pw = float('inf')       # AR per-window-selected checkpoint (for the val-selection ablation)
     best_arval_agg = float('inf')      # AR aggregate-selected checkpoint (for the val-selection ablation)
+    best_valown = float('inf')         # MSE-AR arm selected on its own val loss (mse_rel_ar), not acf2_gap_ar_agg
     history = []
     global_step = 0
     t0 = time.time()
@@ -1063,7 +1067,8 @@ def train(
                       f"price_ic_path_ar={val_metrics['price_ic_path_ar']:.4f}  "
                       f"price_rankic_path_ar={val_metrics['price_rankic_path_ar']:.4f}  "
                       f"return_ic_ar={val_metrics['return_ic_ar']:.4f}  "
-                      f"return_rankic_ar={val_metrics['return_rankic_ar']:.4f}")
+                      f"return_rankic_ar={val_metrics['return_rankic_ar']:.4f}  "
+                      f"mse_rel_ar={val_metrics['mse_rel_ar']:.6f}")
                 # The selection metrics above are bounded correlations and cannot see a rollout
                 # that diverges; these can. Logged for every arm so the gate below, if ever
                 # enabled, rests on a signal already recorded across all of them.
@@ -1126,6 +1131,12 @@ def train(
                 if val_metrics['acf2_gap_ar_agg'] < best_arval_agg:  # aggregate-AR selected
                     best_arval_agg = val_metrics['acf2_gap_ar_agg']
                     model.module.save_pretrained(str(save_dir / 'best_arval_agg_model'))
+                # MSE-AR arm doesn't optimize ACF² (lambda_acf=0), so acf2_gap is not a meaningful
+                # selection signal for it — select by its own val loss (mse_rel_ar) instead.
+                if cfg.lambda_mse > 0.0 and val_metrics['mse_rel_ar'] < best_valown:
+                    best_valown = val_metrics['mse_rel_ar']
+                    model.module.save_pretrained(str(save_dir / 'best_valown_model'))
+                    print(f"  [save] best val-own-loss model  (mse_rel_ar={best_valown:.6f})")
 
             # save every epoch's checkpoint (for oracle test-epoch selection studies)
             if getattr(cfg, 'save_all_epochs', False):
