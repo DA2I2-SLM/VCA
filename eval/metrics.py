@@ -321,10 +321,14 @@ def aggregate_vol_mae(
         ae = np.abs(pred_rv_sq[sym] - true_rv_sq[sym])
         abs_errs.append(ae)
     arr = np.concatenate(abs_errs)
-    arr = arr[np.isfinite(arr)]
+    finite = np.isfinite(arr)
+    arr = arr[finite]
+    sq = arr ** 2
     return {
         'vol_mae':       float(arr.mean()) if len(arr) else np.nan,
         'vol_mae_std':   float(arr.std(ddof=1)) if len(arr) > 1 else np.nan,
+        'vol_mse':       float(sq.mean()) if len(sq) else np.nan,
+        'vol_mse_std':   float(sq.std(ddof=1)) if len(sq) > 1 else np.nan,
         'vol_r2':        _vol_r2(pred_rv_sq, true_rv_sq),
         'n':             int(len(arr)),
     }
@@ -429,10 +433,12 @@ if __name__ == '__main__':
     print(f"  return RankIC  : {ric_ret['ic']:.6f}  (expect ~1.0)")
     print(f"  price IC       : {ic_price['ic']:.6f}  (expect ~1.0)")
     print(f"  vol MAE        : {vol['vol_mae']:.6e}  (expect ~0)")
+    print(f"  vol MSE        : {vol['vol_mse']:.6e}  (expect ~0)")
     print(f"  vol R²         : {vol['vol_r2']:.6f}  (expect ~1.0)")
     print(f"  acf2 gap       : {acf['acf2_gap']:.6e}  (expect ~0)")
     assert ic_ret['ic'] > 0.99, "return IC should be ~1 on perfect preds"
     assert vol['vol_mae'] < 1e-10
+    assert vol['vol_mse'] < 1e-10
     assert acf['acf2_gap'] < 1e-10
     print("OK — perfect-prediction sanity checks pass.")
 

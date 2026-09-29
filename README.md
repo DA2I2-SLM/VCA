@@ -36,14 +36,13 @@ places:
 
 This repo contains the minimal code to run both on one representative dataset (20 liquid Binance
 USDT pairs, 15-minute bars) against `NeoQuasar/Kronos-base`, a pretrained OHLCV foundation model.
-Citation added after review (anonymous submission).
 
 ---
 
 ## <a name="install"></a> 🚀 Installation
 
 ```bash
-git clone <anonymous-repo-url> VCA
+git clone https://github.com/DA2I2-SLM/VCA.git VCA
 cd VCA
 
 conda create -n vca python=3.10 -y
@@ -58,13 +57,13 @@ The Kronos tokenizer and predictor weights (`NeoQuasar/Kronos-Tokenizer-base`,
 
 ## <a name="usage"></a> 🔧 Usage
 
-**Fine-tune with VCA** (arm `A2`: cross-entropy + ACF² loss), 4 GPUs:
+**Fine-tune with VCA** (Method `A2`: cross-entropy + ACF² loss), 4 GPUs:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 finetune/train_predictor.py --arm A2 --seed 42
 ```
 
-**Fine-tune the cross-entropy-only baseline** (arm `A1`) the same way with `--arm A1`.
+**Fine-tune the cross-entropy-only baseline** (Method `A1`) the same way with `--arm A1`.
 
 **Evaluate the frozen backbone / a fine-tuned checkpoint** on the crypto universe:
 
@@ -94,7 +93,7 @@ bash scripts/validate.sh
 | Script | What it does |
 |--------|--------------|
 | `scripts/validate.sh` | End-to-end smoke test on 1 GPU (5 symbols) |
-| `scripts/run_train_vca.sh` | Fine-tunes VCA (arm `A2`) over seeds `42 44 46` |
+| `scripts/run_train_vca.sh` | Fine-tunes VCA (Method `A2`) over seeds `42 44 46` |
 | `scripts/run_eval_baseline.sh` | Evaluates the frozen backbone, and optionally a fine-tuned checkpoint |
 
 The full paper additionally sweeps hyperparameters (lag count `K`, lookback `W`, loss weight
@@ -110,8 +109,8 @@ the core method end-to-end on one dataset.
 |---|---|
 | **Model** | `NeoQuasar/Kronos-base` (predictor) + `NeoQuasar/Kronos-Tokenizer-base` |
 | **Universe** | 20 liquid Binance USDT spot pairs, 15-minute bars (`configs/crypto_top20.yaml`) |
-| **Arms** | `A1` (CE only), `A2` (CE + ACF² = VCA) |
-| **Metrics** | Path-wise RankIC, $\sigma^2$-MAE of realized variance (`eval/metrics.py`) |
+| **Methods** | `A1` (CE only), `A2` (CE + ACF² = VCA) |
+| **Metrics** | Path-wise RankIC, $\sigma^2$-MAE and $\sigma^2$-MSE of realized variance (`eval/metrics.py`) |
 
 ---
 
@@ -121,7 +120,7 @@ the core method end-to-end on one dataset.
 VCA/
 ├── scripts/
 │   ├── validate.sh          # 1-GPU smoke test
-│   ├── run_train_vca.sh     # fine-tune arm A2 over 3 seeds
+│   ├── run_train_vca.sh     # fine-tune Method A2 over 3 seeds
 │   └── run_eval_baseline.sh # evaluate frozen backbone / a checkpoint
 ├── configs/
 │   ├── crypto_top20.yaml    # full 20-symbol recipe
@@ -136,9 +135,9 @@ VCA/
 │   └── utils/training_utils.py
 └── eval/
     ├── inference.py           # autoregressive rollout sampling
-    ├── compute_baseline.py    # cross-sectional eval entrypoint (RankIC, MAE)
+    ├── compute_baseline.py    # cross-sectional eval entrypoint (RankIC, MAE, MSE)
     ├── test_time_control.py   # inference-time re-weighting over cached rollouts
-    └── metrics.py             # RankIC, ACF², σ²-MAE definitions
+    └── metrics.py             # RankIC, ACF², σ²-MAE, σ²-MSE definitions
 ```
 
 ---

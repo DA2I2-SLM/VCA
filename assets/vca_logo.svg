@@ -1,45 +1,50 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0f172a"/>
-      <stop offset="100%" stop-color="#1e293b"/>
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#eef2f7"/>
     </linearGradient>
     <linearGradient id="hi" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#f97316"/>
       <stop offset="100%" stop-color="#fb923c"/>
     </linearGradient>
     <linearGradient id="lo" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#22d3ee"/>
-      <stop offset="100%" stop-color="#0ea5e9"/>
+      <stop offset="0%" stop-color="#0ea5e9"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
     </linearGradient>
   </defs>
 
-  <rect x="4" y="4" width="192" height="192" rx="36" fill="url(#bg)"/>
+  <rect x="4" y="4" width="192" height="192" rx="36" fill="url(#bg)" stroke="#e2e8f0" stroke-width="2"/>
+
+  <!-- background time-series line: calm, then volatility cluster, then calm -->
+  <polyline points="26,132 40,128 54,134 68,124 82,84 96,150 110,70 124,138 138,96 152,120 166,112 180,118"
+            fill="none" stroke="#94a3b8" stroke-width="2.5" stroke-linecap="round"
+            stroke-linejoin="round" opacity="0.55"/>
 
   <!-- volatility-clustering candlesticks: calm / cluster / calm -->
   <g stroke-linecap="round">
     <!-- calm segment -->
-    <line x1="34" y1="100" x2="34" y2="112" stroke="#38bdf8" stroke-width="3"/>
+    <line x1="34" y1="100" x2="34" y2="112" stroke="#0ea5e9" stroke-width="3"/>
     <rect x="29" y="96" width="10" height="20" fill="url(#lo)" rx="2"/>
 
-    <line x1="54" y1="94" x2="54" y2="118" stroke="#38bdf8" stroke-width="3"/>
+    <line x1="54" y1="94" x2="54" y2="118" stroke="#0ea5e9" stroke-width="3"/>
     <rect x="49" y="98" width="10" height="16" fill="url(#lo)" rx="2"/>
 
     <!-- volatility cluster -->
-    <line x1="80" y1="46" x2="80" y2="158" stroke="#fb923c" stroke-width="3.5"/>
+    <line x1="80" y1="46" x2="80" y2="158" stroke="#f97316" stroke-width="3.5"/>
     <rect x="74" y="60" width="12" height="60" fill="url(#hi)" rx="2"/>
 
-    <line x1="102" y1="38" x2="102" y2="150" stroke="#fb923c" stroke-width="3.5"/>
+    <line x1="102" y1="38" x2="102" y2="150" stroke="#f97316" stroke-width="3.5"/>
     <rect x="96" y="50" width="12" height="72" fill="url(#hi)" rx="2"/>
 
-    <line x1="124" y1="52" x2="124" y2="164" stroke="#fb923c" stroke-width="3.5"/>
+    <line x1="124" y1="52" x2="124" y2="164" stroke="#f97316" stroke-width="3.5"/>
     <rect x="118" y="90" width="12" height="58" fill="url(#hi)" rx="2"/>
 
     <!-- calm segment -->
-    <line x1="150" y1="98" x2="150" y2="120" stroke="#38bdf8" stroke-width="3"/>
+    <line x1="150" y1="98" x2="150" y2="120" stroke="#0ea5e9" stroke-width="3"/>
     <rect x="145" y="102" width="10" height="14" fill="url(#lo)" rx="2"/>
 
-    <line x1="170" y1="96" x2="170" y2="114" stroke="#38bdf8" stroke-width="3"/>
+    <line x1="170" y1="96" x2="170" y2="114" stroke="#0ea5e9" stroke-width="3"/>
     <rect x="165" y="99" width="10" height="12" fill="url(#lo)" rx="2"/>
   </g>
 </svg>

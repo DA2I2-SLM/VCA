@@ -520,7 +520,8 @@ def aggregate_metrics(cfg_yaml: dict) -> Dict:
                 ])
             vol = aggregate_vol_mae(pred_rv, true_rv)
             run_results['vol'] = vol
-            print(f"  vol MAE = {vol['vol_mae']:.6e}  R² = {vol['vol_r2']:.4f}  n={vol['n']}")
+            print(f"  vol MAE = {vol['vol_mae']:.6e}  vol MSE = {vol['vol_mse']:.6e}  "
+                  f"R² = {vol['vol_r2']:.4f}  n={vol['n']}")
 
         final[run_name] = run_results
 
