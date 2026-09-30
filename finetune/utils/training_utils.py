@@ -20,8 +20,6 @@ def setup_ddp():
     if not dist.is_available():
         raise RuntimeError("torch.distributed is not available.")
 
-    # Long timeout: heavy AR rollouts (H128) can straggle across ranks and trip the
-    # default 10-min NCCL watchdog even when training is healthy.
     dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=3))
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -55,8 +53,6 @@ def set_seed(seed: int, rank: int = 0):
     torch.manual_seed(actual_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(actual_seed)
-        # The two lines below can impact performance, so they are often
-        # reserved for final experiments where reproducibility is critical.
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
@@ -75,11 +71,11 @@ def get_model_size(model: torch.nn.Module) -> str:
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     if total_params >= 1e9:
-        return f"{total_params / 1e9:.1f}B"  # Billions
+        return f"{total_params / 1e9:.1f}B"
     elif total_params >= 1e6:
-        return f"{total_params / 1e6:.1f}M"  # Millions
+        return f"{total_params / 1e6:.1f}M"
     else:
-        return f"{total_params / 1e3:.1f}K"  # Thousands
+        return f"{total_params / 1e3:.1f}K"
 
 
 def reduce_tensor(tensor: torch.Tensor, world_size: int, op=dist.ReduceOp.SUM) -> torch.Tensor:
@@ -97,8 +93,6 @@ def reduce_tensor(tensor: torch.Tensor, world_size: int, op=dist.ReduceOp.SUM) -
     """
     rt = tensor.clone()
     dist.all_reduce(rt, op=op)
-    # Note: `dist.ReduceOp.AVG` is available in newer torch versions.
-    # For compatibility, manual division is sometimes used after a SUM.
     if op == dist.ReduceOp.AVG:
         rt /= world_size
     return rt

@@ -18,9 +18,6 @@ from typing import Dict, List, Sequence
 import numpy as np
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-window primitives
-# ─────────────────────────────────────────────────────────────────────────────
 
 def acf_sq_returns(close: np.ndarray, max_lag: int, eps: float = 1e-16) -> np.ndarray:
     """
@@ -44,8 +41,6 @@ def acf_sq_returns(close: np.ndarray, max_lag: int, eps: float = 1e-16) -> np.nd
     if denom < eps:
         return np.zeros(max_lag, dtype=np.float64)
     T = len(sq_centered)
-    # Lags k >= T have no valid pairs; fill those with 0 to keep shape (max_lag,).
-    # Without this guard, k > T would produce mismatched slice lengths → ValueError.
     valid = min(max_lag, T - 1)
     result = np.zeros(max_lag, dtype=np.float64)
     result[:valid] = [
@@ -88,9 +83,6 @@ def end_of_window_simple_return(close_path: np.ndarray, anchor_close: float,
     return float(max(close_path[-1], eps) / max(anchor_close, eps) - 1.0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Price-channel IC (multi-channel correlation between paths)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def price_channel_ic(pred_path: np.ndarray, true_path: np.ndarray,
                      rank: bool = False) -> float:
@@ -114,19 +106,19 @@ def price_channel_ic(pred_path: np.ndarray, true_path: np.ndarray,
         be excluded before ranking, since _rankdata() treats NaN as a normal
         (non-tied) value and would otherwise fabricate a spurious IC.
     """
-    n_ch = 4  # O, H, L, C
+    n_ch = 4
     ics = []
     for c in range(n_ch):
         x = pred_path[:, c]
         y = true_path[:, c]
         if np.isnan(x).any() or np.isnan(y).any():
-            continue  # channel not forecast by this backbone
+            continue
         if rank:
             x = _rankdata(x)
             y = _rankdata(y)
         ic = _pearson(x, y)
         if np.isnan(ic):
-            return np.nan  # propagate: constant channel = degenerate window
+            return np.nan
         ics.append(ic)
     if not ics:
         return np.nan
@@ -158,9 +150,6 @@ def _rankdata(x: np.ndarray) -> np.ndarray:
     return ranks
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Cross-sectional aggregation (the central fix)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def cross_sectional_ic(
     pred_returns: Dict[str, np.ndarray],
@@ -194,7 +183,6 @@ def cross_sectional_ic(
     assert symbols == sorted(true_returns.keys()), \
         "pred and true must have same symbol set"
 
-    # Stack: (n_t, n_symbols)
     pred_mat = np.stack([pred_returns[s] for s in symbols], axis=1)
     true_mat = np.stack([true_returns[s] for s in symbols], axis=1)
     assert pred_mat.shape == true_mat.shape
@@ -206,7 +194,6 @@ def cross_sectional_ic(
         pred_vec = pred_mat[t]
         true_vec = true_mat[t]
         mask = np.isfinite(pred_vec) & np.isfinite(true_vec)
-        # Need at least 5 symbols for meaningful cross-section
         if mask.sum() < 5:
             skipped += 1
             continue
@@ -242,7 +229,7 @@ def cross_sectional_ic(
 
 
 def cross_sectional_price_ic(
-    pred_paths: Dict[str, np.ndarray],   # {sym: (n_t, H, D>=4)}
+    pred_paths: Dict[str, np.ndarray],
     true_paths: Dict[str, np.ndarray],
     rank: bool = False,
 ) -> Dict[str, float]:
@@ -269,7 +256,7 @@ def cross_sectional_price_ic(
     per_window_ics = []
     nan_windows = 0
     for sym in symbols:
-        pp = pred_paths[sym]   # (n_t, H, D)
+        pp = pred_paths[sym]
         tp = true_paths[sym]
         assert pp.shape == tp.shape, f"shape mismatch on {sym}: {pp.shape} vs {tp.shape}"
         n_t = pp.shape[0]
@@ -297,12 +284,9 @@ def cross_sectional_price_ic(
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Vol MAE aggregator
-# ─────────────────────────────────────────────────────────────────────────────
 
 def aggregate_vol_mae(
-    pred_rv_sq: Dict[str, np.ndarray],   # {sym: (n_t,)} predicted σ²
+    pred_rv_sq: Dict[str, np.ndarray],
     true_rv_sq: Dict[str, np.ndarray],
 ) -> Dict[str, float]:
     """
@@ -334,6 +318,51 @@ def aggregate_vol_mae(
     }
 
 
+def aggregate_qlike(
+    pred_rv_sq: Dict[str, np.ndarray],
+    true_rv_sq: Dict[str, np.ndarray],
+    winsor: float = 99.0,
+) -> Dict[str, float]:
+    """
+    Patton (2011) QLIKE loss of the realized-variance forecast, pooled over all
+    (symbol, timestamp) pairs:
+
+        r = sigma^2_true / sigma^2_pred
+        QLIKE = mean(r - log(r) - 1)
+
+    QLIKE is asymmetric and unbounded above: r -> inf as sigma^2_pred -> 0, so a
+    single rollout that collapses to near-zero variance dominates the mean. The
+    predictor is therefore floored at 1e-12 and the per-observation losses are
+    winsorized at the `winsor`-th percentile -- the same percentile used for
+    sigma^2-MAE, so the two are trimmed consistently.
+
+    Also returns the median calibration ratio sigma^2_pred / sigma^2_true, which
+    separates a bias (ratio away from 1) from pure dispersion.
+
+    Args:
+        pred_rv_sq : {sym: (n_windows,) sigma^2 predictions, averaged over rollouts}
+        true_rv_sq : same, ground truth
+        winsor     : upper percentile to clip at; None/0 disables winsorization
+    """
+    p_all = np.concatenate([pred_rv_sq[s] for s in sorted(pred_rv_sq.keys())])
+    t_all = np.concatenate([true_rv_sq[s] for s in sorted(true_rv_sq.keys())])
+    ok = np.isfinite(p_all) & np.isfinite(t_all) & (t_all > 0)
+    p = np.maximum(p_all[ok], 1e-12)
+    t = t_all[ok]
+    if len(t) == 0:
+        return {'qlike': np.nan, 'qlike_std': np.nan, 'calib_ratio': np.nan, 'n': 0}
+    r = t / p
+    ql = r - np.log(r) - 1.0
+    if winsor:
+        ql = np.minimum(ql, np.percentile(ql, winsor))
+    return {
+        'qlike':       float(ql.mean()),
+        'qlike_std':   float(ql.std(ddof=1)) if len(ql) > 1 else np.nan,
+        'calib_ratio': float(np.median(p / t)),
+        'n':           int(len(ql)),
+    }
+
+
 def _vol_r2(pred: Dict[str, np.ndarray], true: Dict[str, np.ndarray]) -> float:
     """
     R² for vol forecast across all (symbol, timestamp) — paper's other vol metric.
@@ -351,12 +380,9 @@ def _vol_r2(pred: Dict[str, np.ndarray], true: Dict[str, np.ndarray]) -> float:
     return float(1.0 - ss_res / ss_tot)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ACF² gap aggregator
-# ─────────────────────────────────────────────────────────────────────────────
 
 def aggregate_acf2_gap(
-    pred_acf: Dict[str, np.ndarray],   # {sym: (n_t, K)}  ACF per window
+    pred_acf: Dict[str, np.ndarray],
     true_acf: Dict[str, np.ndarray],
 ) -> Dict[str, float]:
     """
@@ -365,8 +391,8 @@ def aggregate_acf2_gap(
     """
     gaps = []
     for sym in sorted(pred_acf.keys()):
-        diff = pred_acf[sym] - true_acf[sym]                # (n_t, K)
-        g = np.mean(diff ** 2, axis=1)                      # (n_t,)
+        diff = pred_acf[sym] - true_acf[sym]
+        g = np.mean(diff ** 2, axis=1)
         gaps.append(g)
     arr = np.concatenate(gaps)
     arr = arr[np.isfinite(arr)]
@@ -377,14 +403,10 @@ def aggregate_acf2_gap(
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Self-test
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     rng = np.random.default_rng(0)
 
-    # Synthetic test: perfect predictions should give IC=1, vol_MAE=0
     n_t, H, n_sym = 100, 96, 10
     pred_paths, true_paths = {}, {}
     pred_rv, true_rv = {}, {}
@@ -393,20 +415,17 @@ if __name__ == '__main__':
 
     for i in range(n_sym):
         s = f"SYM{i}"
-        # Each symbol gets its own RNG stream → cross-sectional variance is real
         rng_s = np.random.default_rng(seed=i)
-        # Generate n_t × (1 anchor + H forecast bars) = n_t × (H+1) prices
         prices = 100 * np.exp(np.cumsum(rng_s.normal(0, 0.01, n_t * (H + 1))))
         prices = prices.reshape(n_t, H + 1)
-        anchors = prices[:, 0]            # (n_t,)  bar BEFORE the window
-        close_walk = prices[:, 1:]        # (n_t, H) forecast window
-        # Build OHLC paths around the close walk
+        anchors = prices[:, 0]
+        close_walk = prices[:, 1:]
         paths = np.stack([
-            close_walk * 0.9995,    # open ~ close
-            close_walk * 1.0010,    # high
-            close_walk * 0.9990,    # low
-            close_walk,             # close
-        ], axis=2)                  # (n_t, H, 4)
+            close_walk * 0.9995,
+            close_walk * 1.0010,
+            close_walk * 0.9990,
+            close_walk,
+        ], axis=2)
         true_paths[s] = paths
         pred_paths[s] = paths.copy()
 
@@ -421,7 +440,6 @@ if __name__ == '__main__':
         ])
         pred_ret[s] = true_ret[s].copy()
 
-    # Run all metrics
     ic_ret = cross_sectional_ic(pred_ret, true_ret, rank=False)
     ric_ret = cross_sectional_ic(pred_ret, true_ret, rank=True)
     ic_price = cross_sectional_price_ic(pred_paths, true_paths, rank=False)
@@ -442,7 +460,6 @@ if __name__ == '__main__':
     assert acf['acf2_gap'] < 1e-10
     print("OK — perfect-prediction sanity checks pass.")
 
-    # ── Test 2: noisy predictions should degrade smoothly ────────────────
     print("\n=== Self-test 2: noisy predictions ===")
     for noise in [0.1, 0.5, 1.0]:
         rng_n = np.random.default_rng(42)

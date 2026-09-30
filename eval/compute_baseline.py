@@ -44,7 +44,6 @@ import torch
 import torch.distributed as dist
 import yaml
 
-# Add project root to path so we can import Kronos `model` package
 KRONOS_ROOT = Path(__file__).resolve().parent.parent
 if str(KRONOS_ROOT) not in sys.path:
     sys.path.insert(0, str(KRONOS_ROOT))
@@ -55,7 +54,7 @@ from eval.inference import (
 from eval.metrics import (
     acf_sq_returns, realized_variance, end_of_window_simple_return,
     cross_sectional_ic, cross_sectional_price_ic,
-    aggregate_vol_mae, aggregate_acf2_gap,
+    aggregate_vol_mae, aggregate_acf2_gap, aggregate_qlike,
 )
 
 
@@ -102,21 +101,20 @@ def _apply_test_time_control(aligned: dict, control: str, K: int,
     k_cost = K if k_cost is None else int(k_cost)
     if not 1 <= k_cost <= K:
         raise ValueError(f"k_cost={k_cost} must be in [1, K={K}]")
-    # mode: target kind {zero, ctx, oracle}; hard=True → best-of-N (argmin), else soft(beta)
     hard = False
     if control.startswith('soft_zero_b'):
         mode, beta = 'zero', float(control.split('_b')[1])
     elif control.startswith('soft_ctx_b'):
         mode, beta = 'ctx', float(control.split('_b')[1])
-    elif control == 'bestn_zero':        # realizable best-of-N toward rho*=0
+    elif control == 'bestn_zero':
         mode, beta, hard = 'zero', None, True
-    elif control == 'oracle':            # best-of-N toward the TRUE future ACF (unrealizable ceiling)
+    elif control == 'oracle':
         mode, beta, hard = 'oracle', None, True
     else:
         raise ValueError(f"unknown control '{control}'")
-    w = np.exp(-np.arange(1, k_cost + 1) / tau)      # cost weights over the first k_cost lags
+    w = np.exp(-np.arange(1, k_cost + 1) / tau)
     for sym, a in aligned.items():
-        roll = a['pred_per_rollout']                 # (n_t, N, H, D)
+        roll = a['pred_per_rollout']
         n_t, N = roll.shape[0], roll.shape[1]
         ctx_tgt = _lookback_acf_targets(sym, common_ts, cfg_yaml, K) if mode == 'ctx' else None
         ctrl_path = np.full_like(a['pred_paths'], np.nan)
@@ -127,21 +125,19 @@ def _apply_test_time_control(aligned: dict, control: str, K: int,
             if mode == 'ctx':
                 target = ctx_tgt.get(int(common_ts[t])) if ctx_tgt else None
                 if target is None:
-                    continue   # leave NaN → falls back to baseline aggregation downstream
+                    continue
             elif mode == 'oracle':
                 target = acf_sq_returns(a['true_paths'][t, :, CLOSE_IDX], K)
             else:
                 target = np.zeros(K)
             racf = np.stack([acf_sq_returns(roll[t, n, :, CLOSE_IDX], K) for n in range(N)])
-            # cost over near-lags only; ensemble ACF (below) stays full K-dim for the metric
             C = (w * (racf[:, :k_cost] - target[:k_cost]) ** 2).sum(-1)
             if hard:
-                pi = np.zeros(N); pi[int(np.argmin(C))] = 1.0   # best-of-N: pick single rollout
+                pi = np.zeros(N); pi[int(np.argmin(C))] = 1.0
             else:
                 pi = np.exp(-beta * (C - C.min())); pi /= pi.sum()
             ctrl_path[t] = (pi[:, None, None] * roll[t]).sum(0)
             ctrl_acf[t] = (pi[:, None] * racf).sum(0)
-        # for ctx rows that fell back (NaN), keep the uniform mean path + mean-of-acf
         if mode == 'ctx':
             for t in range(n_t):
                 if np.isnan(ctrl_path[t]).all() and np.isfinite(roll[t]).all():
@@ -152,9 +148,6 @@ def _apply_test_time_control(aligned: dict, control: str, K: int,
         a['ctrl_acf'] = ctrl_acf
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Distributed setup helpers
-# ─────────────────────────────────────────────────────────────────────────────
 def get_rank_world():
     """Get distributed rank and world size; falls back to single-process."""
     if dist.is_available() and dist.is_initialized():
@@ -168,11 +161,6 @@ def setup_distributed():
     """Initialise process group if running under torchrun."""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         if not dist.is_initialized():
-            # Default 10-min collective timeout is shorter than a single symbol's
-            # inference time at large lookback (W320 ~20 min/symbol) → ranks that
-            # finish their symbol list slightly later than others get killed while
-            # still computing, not actually stuck. Give enough slack for the
-            # slowest plausible single symbol plus a margin.
             dist.init_process_group(backend='nccl', timeout=datetime.timedelta(minutes=60))
         rank = dist.get_rank()
         torch.cuda.set_device(rank % torch.cuda.device_count())
@@ -180,9 +168,6 @@ def setup_distributed():
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Predictions cache (per symbol × run × rank)
-# ─────────────────────────────────────────────────────────────────────────────
 def get_predictions_dir(cfg_yaml: dict) -> Path:
     """
     Return the root directory for cached pkl predictions.
@@ -209,7 +194,6 @@ def cache_path(pred_dir: Path, run_name: str, symbol: str) -> Path:
 
 def save_predictions(out_path: Path, data: Dict):
     """Save predictions in a forward-compatible pickle format."""
-    # Convert datetime64 to int64 ns for portability
     if 'timestamps' in data and data['timestamps'].dtype.kind == 'M':
         data = {**data, 'timestamps': data['timestamps'].astype('int64')}
     with open(out_path, 'wb') as f:
@@ -224,9 +208,6 @@ def load_predictions(in_path: Path) -> Dict:
     return data
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Inference phase (distributed across GPUs, one symbol per rank-cycle)
-# ─────────────────────────────────────────────────────────────────────────────
 def run_inference_for_symbols(
     cfg_yaml: dict,
     symbols: List[str],
@@ -243,24 +224,17 @@ def run_inference_for_symbols(
     rank, world = get_rank_world()
     device = torch.device(f'cuda:{rank % torch.cuda.device_count()}')
 
-    # Load models on this rank's GPU
     if rank == 0:
         print(f"[rank 0] loading {cfg_yaml['model_id']} ({backbone}) on {device}")
 
     if backbone == 'chronos':
         from chronos import BaseChronosPipeline
-        # float32: T5 is known to NaN under fp16, and V100 (Volta) lacks bf16
-        # tensor-core support; chronos-t5-small is tiny so the cost is negligible.
         pipeline = BaseChronosPipeline.from_pretrained(
             cfg_yaml['model_id'], device_map=str(device), torch_dtype=torch.float32)
         checkpoint = cfg_yaml.get('checkpoint')
         if checkpoint:
-            # Phase-2 Chronos fine-tunes save a raw T5 state_dict (train_predictor_chronos.py
-            # torch.save(t5.state_dict(), ...)), not a from_pretrained-loadable directory like
-            # Kronos checkpoints, so it's loaded onto the base architecture instead of replacing
-            # model_id.
             sd = torch.load(checkpoint, map_location=device)
-            pipeline.model.model.load_state_dict(sd, strict=True)  # raises on any key mismatch
+            pipeline.model.model.load_state_dict(sd, strict=True)
             if rank == 0:
                 print(f"[rank 0] loaded fine-tuned checkpoint {checkpoint}")
         pipeline.model.model.eval()
@@ -270,7 +244,6 @@ def run_inference_for_symbols(
         tokenizer = KronosTokenizer.from_pretrained(cfg_yaml['tokenizer_id']).to(device).eval()
         model = Kronos.from_pretrained(cfg_yaml['model_id']).to(device).eval()
 
-    # Assign symbols to this rank (round-robin)
     my_symbols = [s for i, s in enumerate(symbols) if i % world == rank]
     print(f"[rank {rank}] device={device}  symbols={my_symbols}")
 
@@ -327,14 +300,10 @@ def run_inference_for_symbols(
         print(f"[rank {rank}] {sym}: saved {cache_file.name} "
               f"({result['n_windows']} windows, {(time.time()-t0)/60:.1f} min)")
 
-    # Barrier so metric aggregation only happens after ALL ranks done
     if dist.is_initialized():
         dist.barrier()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Metric aggregation (single-process; reads all cached predictions)
-# ─────────────────────────────────────────────────────────────────────────────
 def aggregate_metrics(cfg_yaml: dict) -> Dict:
     """
     Read all cached predictions and compute paper-aligned metrics.
@@ -367,7 +336,6 @@ def aggregate_metrics(cfg_yaml: dict) -> Dict:
         wanted = set(run['metrics'])
         print(f"\n=== Aggregating run '{run_name}' (T={T}, metrics={wanted}) ===")
 
-        # Load all symbol predictions for this run
         per_sym: Dict[str, dict] = {}
         for sym in symbols:
             cf = cache_path(pred_dir, run_name, sym)
@@ -383,11 +351,6 @@ def aggregate_metrics(cfg_yaml: dict) -> Dict:
             print(f"  No predictions found for run '{run_name}' — skipping")
             continue
 
-        # Align windows by timestamp using the reference symbol's timeline.
-        # Use the symbol with the most windows as the reference grid; all other
-        # symbols participate only at timestamps where they have data.
-        # Symbols delisted mid-period (e.g. MATICUSDT → POL Sep 2024) contribute
-        # NaN for missing timestamps — cross_sectional_ic already masks NaN.
         ref_sym = max(per_sym, key=lambda s: per_sym[s]['n_windows'])
         ref_ts = per_sym[ref_sym]['timestamps'].astype('int64')
         common = sorted(ref_ts.tolist())
@@ -397,7 +360,6 @@ def aggregate_metrics(cfg_yaml: dict) -> Dict:
         print(f"  {len(per_sym)} symbols, {n_common} timestamps "
               f"(ref={ref_sym}, {n_partial} partial symbols)")
 
-        # Build aligned dicts: NaN-fill missing windows for partial symbols
         aligned: Dict[str, Dict] = {}
         for sym, d in per_sym.items():
             ts_int = d['timestamps'].astype('int64')
@@ -425,7 +387,6 @@ def aggregate_metrics(cfg_yaml: dict) -> Dict:
                 'anchor_close':     anch_out,
             }
 
-        # test-time control (no-op unless cfg_yaml['control'] set, forecast run only)
         if run_name == 'forecast':
             _apply_test_time_control(aligned, cfg_yaml.get('control', 'none'), K,
                                      common_ts=common, cfg_yaml=cfg_yaml,
@@ -437,12 +398,11 @@ def aggregate_metrics(cfg_yaml: dict) -> Dict:
                        'control_tau': cfg_yaml.get('control_tau', 2.0),
                        'control_kcost': cfg_yaml.get('control_kcost', K)}
 
-        # ── Return IC/RankIC ─────────────────────────────────────────────
         if 'return_ic' in wanted:
             pred_ret = {}
             true_ret = {}
             for sym, a in aligned.items():
-                pred_close = a['pred_paths'][:, :, CLOSE_IDX]      # (n_t, H)
+                pred_close = a['pred_paths'][:, :, CLOSE_IDX]
                 true_close = a['true_paths'][:, :, CLOSE_IDX]
                 anchors = a['anchor_close']
                 pred_ret[sym] = np.array([
@@ -460,7 +420,6 @@ def aggregate_metrics(cfg_yaml: dict) -> Dict:
             print(f"  return  IC={ic['ic']:+.4f}  tstat={ic['ic_tstat']:.2f}  n_t={ic['n_t']}")
             print(f"  return RankIC={ric['ic']:+.4f}  tstat={ric['ic_tstat']:.2f}")
 
-        # ── Price Series IC/RankIC (paper Table 14) ───────────────────────
         if 'price_ic' in wanted:
             pred_paths = {s: a['pred_paths'] for s, a in aligned.items()}
             true_paths = {s: a['true_paths'] for s, a in aligned.items()}
@@ -472,20 +431,15 @@ def aggregate_metrics(cfg_yaml: dict) -> Dict:
                   f"n_windows={pic['n_windows']}")
             print(f"  price RankIC={pric['ic']:+.4f}  tstat={pric['ic_tstat']:.2f}")
 
-        # ── ACF² gap (forecast window only) ─────────────────────────────
         if 'acf2_gap' in wanted:
             pred_acf = {}
             true_acf = {}
             for sym, a in aligned.items():
-                # Use per-rollout paths, not the mean — averaging paths before
-                # ACF kills the autocorrelation structure in squared returns.
-                # Compute ACF per rollout then average, consistent with vol MAE.
-                # With test-time control, use the weighted ensemble ACF instead.
                 true_close = a['true_paths'][:, :, CLOSE_IDX]
                 if 'ctrl_acf' in a:
                     pred_acf[sym] = a['ctrl_acf']
                 else:
-                    rollouts = a['pred_per_rollout'][:, :, :, CLOSE_IDX]  # (n_t, N, H)
+                    rollouts = a['pred_per_rollout'][:, :, :, CLOSE_IDX]
                     N_r = rollouts.shape[1]
                     pred_acf[sym] = np.stack([
                         np.mean([acf_sq_returns(rollouts[t, n], K)
@@ -500,37 +454,34 @@ def aggregate_metrics(cfg_yaml: dict) -> Dict:
             print(f"  ACF² gap = {acf_res['acf2_gap']:.6e} "
                   f"± {acf_res['acf2_gap_std']:.6e}  n={acf_res['n']}")
 
-        # ── Volatility MAE (paper Eq. 12 σ², not σ) ──────────────────────
         if 'vol_mae' in wanted:
             pred_rv = {}
             true_rv = {}
             for sym, a in aligned.items():
-                # Per paper, vol is computed on PREDICTED close path only.
-                # Average σ² across rollouts to get a single prediction per window.
-                rollouts = a['pred_per_rollout'][:, :, :, CLOSE_IDX]  # (n_t, N, H)
+                rollouts = a['pred_per_rollout'][:, :, :, CLOSE_IDX]
                 pred_rv_per_rollout = np.array([
                     [realized_variance(rollouts[t, n])
                      for n in range(rollouts.shape[1])]
                     for t in range(n_common)
                 ])
-                pred_rv[sym] = pred_rv_per_rollout.mean(axis=1)        # (n_t,)
+                pred_rv[sym] = pred_rv_per_rollout.mean(axis=1)
                 true_close = a['true_paths'][:, :, CLOSE_IDX]
                 true_rv[sym] = np.array([
                     realized_variance(true_close[t]) for t in range(n_common)
                 ])
             vol = aggregate_vol_mae(pred_rv, true_rv)
+            ql = aggregate_qlike(pred_rv, true_rv)
+            vol['n_qlike'] = ql.pop('n')
+            vol.update(ql)
             run_results['vol'] = vol
             print(f"  vol MAE = {vol['vol_mae']:.6e}  vol MSE = {vol['vol_mse']:.6e}  "
-                  f"R² = {vol['vol_r2']:.4f}  n={vol['n']}")
+                  f"QLIKE = {vol['qlike']:.6f}  R² = {vol['vol_r2']:.4f}  n={vol['n']}")
 
         final[run_name] = run_results
 
     return final
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entrypoint
-# ─────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', required=True)
@@ -595,7 +546,6 @@ def main():
     if rank == 0:
         print(f"Predictions cache: {pred_dir}")
 
-    # ── Phase 1: inference (each run is a separate inference pass) ────────
     if not args.cache_only:
         for run in cfg_yaml['runs']:
             if rank == 0:
@@ -608,7 +558,6 @@ def main():
                 n_rollouts=run.get('n_rollouts', cfg_yaml['n_rollouts']),
             )
 
-    # ── Phase 2: metric aggregation (rank 0 only) ────────────────────────
     if rank == 0:
         results = aggregate_metrics(cfg_yaml)
         base = cfg_yaml['results_file']
@@ -617,8 +566,6 @@ def main():
             base = f'{stem}_{args.run_tag}.{ext}'
         out_file = out_dir / base
         with open(out_file, 'w') as f:
-            # Pickle/JSON-friendly: convert any nan to None? leave as 'NaN' string?
-            # Custom encoder handles np types and NaN.
             json.dump(results, f, indent=2, default=_json_default)
         print(f"\nResults → {out_file}")
 

@@ -1,5 +1,7 @@
 numpy
 pandas==2.2.2
+scipy
+
 # Install torch to match your CUDA driver, e.g.:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu126
 torch>=2.0.0,<3.0.0
@@ -12,3 +14,12 @@ pyyaml
 
 # Binance data download
 python-binance
+
+# Chronos-T5 backbone (eval/inference_chronos.py,
+# finetune/train_predictor_chronos.py). Not needed for the Kronos path.
+chronos-forecasting
+
+# CSI300 / CSI500 only: data/export_csi300_qlib.py reads a local Qlib bundle.
+# Uncomment, then install the bundle itself (it is not on PyPI):
+#   python -m qlib.run.get_data qlib_data --target_dir ~/.qlib/qlib_data/cn_data --region cn
+# pyqlib

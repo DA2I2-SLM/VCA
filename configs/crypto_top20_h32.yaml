@@ -1,60 +1,80 @@
-# Small single-GPU config for scripts/validate.sh — a quick end-to-end smoke test,
-# not a paper-quality run. See crypto_top20.yaml for the full recipe.
+# Configuration for cross-sectional baseline on top-20 Binance USDT pairs.
+# Paper-aligned: test period starts after pretrain cutoff (Jun 2024).
 
 # ── universe ────────────────────────────────────────────────────────────────
+# Top 20 Binance USDT spot pairs by 24h volume as of Mar 2024 snapshot.
+# Drop pairs without sufficient history at download time.
 symbols:
   - BTCUSDT
   - ETHUSDT
   - BNBUSDT
   - SOLUSDT
   - XRPUSDT
+  - ADAUSDT
+  - DOGEUSDT
+  - AVAXUSDT
+  - DOTUSDT
+  - MATICUSDT
+  - LINKUSDT
+  - LTCUSDT
+  - BCHUSDT
+  - ATOMUSDT
+  - UNIUSDT
+  - ETCUSDT
+  - XLMUSDT
+  - FILUSDT
+  - NEARUSDT
+  - APTUSDT
 
 # ── data ────────────────────────────────────────────────────────────────────
-# Same date range as crypto_top20.yaml (finetune/config.py's Phase2Config hardcodes
-# these train/val periods, so the downloaded CSVs must cover them for
-# scripts/validate.sh's fine-tuning step to see any windows). Fewer symbols is what
-# actually makes this a "demo" — the date range is unchanged.
 data_dir: /scratch/$USER/Kronos/data
 frequency: 15m
+# Long span for future fine-tuning. For baseline only the test portion matters.
 download_start: '2021-01-01'
 download_end:   '2025-06-01'
 
+# Splits (strict post-cutoff test, paper-aligned)
 train_period: ['2021-01-01', '2023-12-31']
 val_period:   ['2024-01-01', '2024-06-30']
 test_period:  ['2024-07-01', '2025-06-01']
 
 # ── windows ─────────────────────────────────────────────────────────────────
-lookback:  160
-pred_len:  32
-stride:    32
+lookback:  160   # paper Table 8: 15-min frequency lookback
+pred_len:  32    # paper Table 8: 15-min frequency horizon
+stride:    32    # non-overlapping windows
 
 # ── inference ───────────────────────────────────────────────────────────────
-n_rollouts: 10
+n_rollouts: 10   # paper Table 6: N=10 for forecasting
 max_context: 512
 clip: 5.0
 top_p: 0.90
 top_k: 0
 
+# Paper Appendix D: exclude volume/amount for crypto & forex assets at inference time.
+# CSV files retain all 6 columns; zeroing is applied in infer_symbol.
 zero_vol_amount: true
 
+# Per-task temperature and rollout count (paper Table 6). Each is a separate inference run.
 runs:
   - name: forecast
-    temperature: 0.6
-    n_rollouts: 10
+    temperature: 0.6      # for IC/RankIC on price & return
+    n_rollouts: 10        # paper Table 6: N=10 for forecasting
     metrics: [price_ic, return_ic, acf2_gap]
   - name: volatility
-    temperature: 0.9
-    n_rollouts: 1
+    temperature: 0.9      # for vol MAE
+    n_rollouts: 1         # paper Table 6: N=1 for volatility
     metrics: [vol_mae]
 
 # ── metrics ─────────────────────────────────────────────────────────────────
-acf_lags: 15
+# ACF computed on predicted future window only (matches file md v2 definition).
+acf_lags: 15   # K=15: maximum consistent with pred_len=32 (31 sq. returns, T >= 2K: 31 >= 30)
 acf_floor_eps: 1e-16
 
 # ── compute ─────────────────────────────────────────────────────────────────
-n_gpus: 1
-batch_size_per_gpu: 4
-fp16: true
+# Multi-GPU parallelism: 1 symbol per GPU process.
+n_gpus: 8
+batch_size_per_gpu: 8     # windows per inference call on each GPU
+fp16: true                # V100 native (NOT bfloat16)
 
 # ── model ───────────────────────────────────────────────────────────────────
 tokenizer_id: NeoQuasar/Kronos-Tokenizer-base
@@ -62,5 +82,6 @@ model_id:     NeoQuasar/Kronos-base
 
 # ── output ──────────────────────────────────────────────────────────────────
 output_dir: outputs/
-results_file: baseline_crypto_demo.json
-predictions_cache_dir: /scratch/$USER/Kronos/predictions/crypto_demo
+results_file: baseline_crypto_top20_h32.json
+# pkl files go to scratch — large storage, not backed up, survives job duration
+predictions_cache_dir: /scratch/$USER/Kronos/predictions/crypto_top20_h32

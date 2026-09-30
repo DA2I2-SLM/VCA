@@ -1,5 +1,6 @@
-# Small single-GPU config for scripts/validate.sh — a quick end-to-end smoke test,
-# not a paper-quality run. See crypto_top20.yaml for the full recipe.
+# H=96 (24h horizon) config — same universe as crypto_top20 but longer horizon.
+# Motivation: ACF² clustering signal is ~3× stronger at 24h vs 8h (ρ₁≈0.13 vs ρ₁≈0.06),
+# giving more meaningful headroom for Phase 2 fine-tuning.
 
 # ── universe ────────────────────────────────────────────────────────────────
 symbols:
@@ -8,12 +9,23 @@ symbols:
   - BNBUSDT
   - SOLUSDT
   - XRPUSDT
+  - ADAUSDT
+  - DOGEUSDT
+  - AVAXUSDT
+  - DOTUSDT
+  - MATICUSDT
+  - LINKUSDT
+  - LTCUSDT
+  - BCHUSDT
+  - ATOMUSDT
+  - UNIUSDT
+  - ETCUSDT
+  - XLMUSDT
+  - FILUSDT
+  - NEARUSDT
+  - APTUSDT
 
 # ── data ────────────────────────────────────────────────────────────────────
-# Same date range as crypto_top20.yaml (finetune/config.py's Phase2Config hardcodes
-# these train/val periods, so the downloaded CSVs must cover them for
-# scripts/validate.sh's fine-tuning step to see any windows). Fewer symbols is what
-# actually makes this a "demo" — the date range is unchanged.
 data_dir: /scratch/$USER/Kronos/data
 frequency: 15m
 download_start: '2021-01-01'
@@ -24,9 +36,9 @@ val_period:   ['2024-01-01', '2024-06-30']
 test_period:  ['2024-07-01', '2025-06-01']
 
 # ── windows ─────────────────────────────────────────────────────────────────
-lookback:  160
-pred_len:  32
-stride:    32
+lookback:  160   # paper Table 8: 15-min frequency lookback
+pred_len:  16    # 24h × 4 bars/h — 3× longer than h32, stronger ACF signal
+stride:    16    # non-overlapping 24h windows
 
 # ── inference ───────────────────────────────────────────────────────────────
 n_rollouts: 10
@@ -48,12 +60,12 @@ runs:
     metrics: [vol_mae]
 
 # ── metrics ─────────────────────────────────────────────────────────────────
-acf_lags: 15
+acf_lags: 5   # K=20: valid with T=95 sq. returns (T >= 2K: 95 >= 40 ✓)
 acf_floor_eps: 1e-16
 
 # ── compute ─────────────────────────────────────────────────────────────────
-n_gpus: 1
-batch_size_per_gpu: 4
+n_gpus: 2
+batch_size_per_gpu: 4     # smaller batch: H=96 uses ~3× more memory than H=32
 fp16: true
 
 # ── model ───────────────────────────────────────────────────────────────────
@@ -62,5 +74,6 @@ model_id:     NeoQuasar/Kronos-base
 
 # ── output ──────────────────────────────────────────────────────────────────
 output_dir: outputs/
-results_file: baseline_crypto_demo.json
-predictions_cache_dir: /scratch/$USER/Kronos/predictions/crypto_demo
+results_file: baseline_crypto_top20_h16.json
+# pkl files go to scratch — large storage, not backed up, survives job duration
+predictions_cache_dir: /scratch/$USER/Kronos/predictions/crypto_top20_h16

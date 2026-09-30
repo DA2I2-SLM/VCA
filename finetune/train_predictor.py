@@ -35,15 +35,12 @@ sys.path.append(str(Path(__file__).parent.parent))
 from model.kronos import KronosTokenizer, Kronos
 from finetune.config import Phase2Config, arm_preset
 from finetune.dataset import CryptoWindowDataset
-from eval.metrics import price_channel_ic  # path-shape Price IC/RankIC (paper Table 14)
+from eval.metrics import price_channel_ic
 from finetune.utils.training_utils import (
     setup_ddp, cleanup_ddp, set_seed, get_model_size, format_time,
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Soft decode helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _build_bit_matrix(n_bits: int, device: torch.device) -> torch.Tensor:
     """
@@ -55,17 +52,17 @@ def _build_bit_matrix(n_bits: int, device: torch.device) -> torch.Tensor:
     indices = torch.arange(vocab, device=device)
     bit_pos = torch.arange(n_bits, device=device)
     bits_0_1 = ((indices.unsqueeze(-1) >> bit_pos.unsqueeze(0)) & 1).float()
-    return bits_0_1 * 2 - 1  # (vocab, n_bits) in {-1, +1}
+    return bits_0_1 * 2 - 1
 
 
 def soft_decode_prices(
-    s1_logits: torch.Tensor,   # (B, H, vocab_s1)
-    s2_logits: torch.Tensor,   # (B, H, vocab_s2)
+    s1_logits: torch.Tensor,
+    s2_logits: torch.Tensor,
     tokenizer: KronosTokenizer,
     tau: float,
-    x_means: torch.Tensor,     # (B, 6)
-    x_stds: torch.Tensor,      # (B, 6)
-) -> torch.Tensor:             # (B, H, 6) denormalized prices
+    x_means: torch.Tensor,
+    x_stds: torch.Tensor,
+) -> torch.Tensor:
     """
     Differentiable price reconstruction via Gumbel-softmax relaxation.
 
@@ -78,41 +75,36 @@ def soft_decode_prices(
     s2_bits = tokenizer.s2_bits
     codebook_dim = s1_bits + s2_bits
 
-    s1_bit_mat = _build_bit_matrix(s1_bits, s1_logits.device)  # (vocab_s1, s1_bits)
-    s2_bit_mat = _build_bit_matrix(s2_bits, s2_logits.device)  # (vocab_s2, s2_bits)
+    s1_bit_mat = _build_bit_matrix(s1_bits, s1_logits.device)
+    s2_bit_mat = _build_bit_matrix(s2_bits, s2_logits.device)
 
-    # Gumbel-softmax: (B*H, vocab)
     soft_s1 = F.gumbel_softmax(s1_logits.reshape(-1, vocab_s1), tau=tau, hard=False)
     soft_s2 = F.gumbel_softmax(s2_logits.reshape(-1, vocab_s2), tau=tau, hard=False)
 
-    # Project to bit space: (B*H, n_bits)
     soft_bits_s1 = soft_s1 @ s1_bit_mat
     soft_bits_s2 = soft_s2 @ s2_bit_mat
 
-    # Concatenate and apply BSQ l2-norm scale: (B*H, codebook_dim)
     q_scale = 1.0 / math.sqrt(codebook_dim)
     soft_full = torch.cat([soft_bits_s1, soft_bits_s2], dim=-1) * q_scale
 
     soft_full = soft_full.view(B, H, codebook_dim)
 
-    # Frozen decoder path (tokenizer.post_quant_embed → decoder → head)
     z = tokenizer.post_quant_embed(soft_full)
     for layer in tokenizer.decoder:
         z = layer(z)
-    prices_norm = tokenizer.head(z)  # (B, H, 6) normalized
+    prices_norm = tokenizer.head(z)
 
-    # Denormalize
     prices = prices_norm * (x_stds.unsqueeze(1) + 1e-5) + x_means.unsqueeze(1)
     return prices
 
 
 def _soft_tokens_to_prices(
-    soft_s1: torch.Tensor,   # (B, H, vocab_s1) — probability simplex per step
-    soft_s2: torch.Tensor,   # (B, H, vocab_s2)
+    soft_s1: torch.Tensor,
+    soft_s2: torch.Tensor,
     tokenizer: KronosTokenizer,
-    x_means: torch.Tensor,   # (B, 6)
-    x_stds: torch.Tensor,    # (B, 6)
-) -> torch.Tensor:           # (B, H, 6) denormalized prices
+    x_means: torch.Tensor,
+    x_stds: torch.Tensor,
+) -> torch.Tensor:
     """
     Decode already-soft tokens (no Gumbel here — the caller sampled them) through the
     frozen tokenizer decoder. Same bit-projection path as soft_decode_prices, but takes
@@ -121,14 +113,14 @@ def _soft_tokens_to_prices(
     s1_bits = tokenizer.s1_bits
     s2_bits = tokenizer.s2_bits
     codebook_dim = s1_bits + s2_bits
-    s1_bit_mat = _build_bit_matrix(s1_bits, soft_s1.device)  # (vocab_s1, s1_bits)
+    s1_bit_mat = _build_bit_matrix(s1_bits, soft_s1.device)
     s2_bit_mat = _build_bit_matrix(s2_bits, soft_s2.device)
 
-    soft_bits_s1 = soft_s1 @ s1_bit_mat   # (B, H, s1_bits)
+    soft_bits_s1 = soft_s1 @ s1_bit_mat
     soft_bits_s2 = soft_s2 @ s2_bit_mat
 
     q_scale = 1.0 / math.sqrt(codebook_dim)
-    soft_full = torch.cat([soft_bits_s1, soft_bits_s2], dim=-1) * q_scale  # (B, H, codebook_dim)
+    soft_full = torch.cat([soft_bits_s1, soft_bits_s2], dim=-1) * q_scale
 
     z = tokenizer.post_quant_embed(soft_full)
     for layer in tokenizer.decoder:
@@ -139,17 +131,17 @@ def _soft_tokens_to_prices(
 
 
 def ar_rollout_prices(
-    m,                         # underlying Kronos module (NOT the DDP wrapper)
+    m,
     tokenizer: KronosTokenizer,
-    x_norm: torch.Tensor,      # (B, L, 6) normalized lookback context
-    full_stamp: torch.Tensor,  # (B, L+H, 5)
-    x_mean: torch.Tensor,      # (B, 6)
-    x_std: torch.Tensor,       # (B, 6)
+    x_norm: torch.Tensor,
+    full_stamp: torch.Tensor,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
     H: int,
     tau: float,
     use_checkpoint: bool = True,
     hard: bool = False,
-) -> torch.Tensor:             # (B, H, 6) denormalized prices of the generated trajectory
+) -> torch.Tensor:
     """
     Fully differentiable autoregressive rollout.
 
@@ -169,13 +161,12 @@ def ar_rollout_prices(
     emb = m.embedding
     d = m.d_model
 
-    # context tokens are discrete & fixed (no grad through tokenizer encode)
     with torch.no_grad():
-        tok_s1_ctx, tok_s2_ctx = tokenizer.encode(x_norm, half=True)  # (B, L)
+        tok_s1_ctx, tok_s2_ctx = tokenizer.encode(x_norm, half=True)
 
-    seq_emb = emb([tok_s1_ctx, tok_s2_ctx])  # (B, L, d) — grad flows through emb params
+    seq_emb = emb([tok_s1_ctx, tok_s2_ctx])
 
-    def _trunk(x_in):  # transformer stack + final norm (the memory-dominant part)
+    def _trunk(x_in):
         for layer in m.transformer:
             x_in = layer(x_in)
         return m.norm(x_in)
@@ -184,49 +175,44 @@ def ar_rollout_prices(
     for _ in range(H):
         cur = seq_emb.shape[1]
         x_in = m.token_drop(seq_emb + m.time_emb(full_stamp[:, :cur]))
-        # checkpoint the 24-layer trunk: store only its input, recompute in backward.
-        # Without this the H=32 sequential passes blow V100 memory (see git history / OOM).
         if use_checkpoint:
             x = checkpoint(_trunk, x_in, use_reentrant=False)
         else:
             x = _trunk(x_in)
 
-        s1_logits_all = m.head(x)                                    # (B, cur, vocab_s1)
-        # NaN/inf guard: the H-step Gumbel÷tau rollout can blow logits to inf→nan and crash
-        # the sampler (CUDA "probability tensor contains inf/nan"). Clamp before gumbel_softmax.
+        s1_logits_all = m.head(x)
         s1_logits_all = torch.nan_to_num(s1_logits_all, nan=0.0, posinf=30.0, neginf=-30.0)
         soft_s1_all = F.gumbel_softmax(s1_logits_all, tau=tau, hard=hard, dim=-1)
-        sibling_all = soft_s1_all @ emb.emb_s1.weight                # (B, cur, d)
-        x2 = m.dep_layer(x, sibling_all)                            # full-seq cross-attn (RoPE-correct)
-        s2_logits_last = m.head.cond_forward(x2)[:, -1]             # (B, vocab_s2)
+        sibling_all = soft_s1_all @ emb.emb_s1.weight
+        x2 = m.dep_layer(x, sibling_all)
+        s2_logits_last = m.head.cond_forward(x2)[:, -1]
 
-        soft_s1_last = soft_s1_all[:, -1]                           # (B, vocab_s1)
+        soft_s1_last = soft_s1_all[:, -1]
         s2_logits_last = torch.nan_to_num(s2_logits_last, nan=0.0, posinf=30.0, neginf=-30.0)
         soft_s2_last = F.gumbel_softmax(s2_logits_last, tau=tau, hard=hard, dim=-1)
         soft_s1_list.append(soft_s1_last)
         soft_s2_list.append(soft_s2_last)
 
-        # soft fused embedding for the generated token (HierarchicalEmbedding soft path)
         s1e = (soft_s1_last @ emb.emb_s1.weight) * math.sqrt(d)
         s2e = (soft_s2_last @ emb.emb_s2.weight) * math.sqrt(d)
-        fused = emb.fusion_proj(torch.cat([s1e, s2e], dim=-1)).unsqueeze(1)  # (B, 1, d)
+        fused = emb.fusion_proj(torch.cat([s1e, s2e], dim=-1)).unsqueeze(1)
         seq_emb = torch.cat([seq_emb, fused], dim=1)
 
-    soft_s1 = torch.stack(soft_s1_list, dim=1)  # (B, H, vocab_s1)
+    soft_s1 = torch.stack(soft_s1_list, dim=1)
     soft_s2 = torch.stack(soft_s2_list, dim=1)
     return _soft_tokens_to_prices(soft_s1, soft_s2, tokenizer, x_mean, x_std)
 
 
 @torch.no_grad()
 def ar_argmax_prices(
-    m,                         # underlying Kronos module
+    m,
     tokenizer: KronosTokenizer,
-    x_norm: torch.Tensor,      # (B, L, 6) normalized lookback context
-    full_stamp: torch.Tensor,  # (B, L+H, 5)
-    x_mean: torch.Tensor,      # (B, 6)
-    x_std: torch.Tensor,       # (B, 6)
+    x_norm: torch.Tensor,
+    full_stamp: torch.Tensor,
+    x_mean: torch.Tensor,
+    x_std: torch.Tensor,
     H: int,
-) -> torch.Tensor:             # (B, H, 6) denormalized prices
+) -> torch.Tensor:
     """
     Non-differentiable GREEDY autoregressive rollout for VAL selection (no grad, argmax,
     hard tokens fed back). Matches the test-time generation procedure (autoregressive) so the
@@ -234,7 +220,7 @@ def ar_argmax_prices(
     in eval_val. Greedy (not sampled) keeps it deterministic and cheap for per-epoch selection.
     """
     emb = m.embedding
-    seq_s1, seq_s2 = tokenizer.encode(x_norm, half=True)  # (B, L) each
+    seq_s1, seq_s2 = tokenizer.encode(x_norm, half=True)
     gen_s1, gen_s2 = [], []
     for _ in range(H):
         cur = seq_s1.shape[1]
@@ -242,30 +228,27 @@ def ar_argmax_prices(
         for layer in m.transformer:
             x = layer(x)
         x = m.norm(x)
-        s1_ids_all = m.head(x).argmax(-1)              # (B, cur)
-        sibling_all = emb.emb_s1(s1_ids_all)           # (B, cur, d)
-        x2 = m.dep_layer(x, sibling_all)               # full-seq cross-attn (RoPE-correct)
-        s2_last = m.head.cond_forward(x2)[:, -1].argmax(-1, keepdim=True)  # (B, 1)
-        s1_last = s1_ids_all[:, -1:]                    # (B, 1)
+        s1_ids_all = m.head(x).argmax(-1)
+        sibling_all = emb.emb_s1(s1_ids_all)
+        x2 = m.dep_layer(x, sibling_all)
+        s2_last = m.head.cond_forward(x2)[:, -1].argmax(-1, keepdim=True)
+        s1_last = s1_ids_all[:, -1:]
         gen_s1.append(s1_last)
         gen_s2.append(s2_last)
         seq_s1 = torch.cat([seq_s1, s1_last], dim=1)
         seq_s2 = torch.cat([seq_s2, s2_last], dim=1)
 
-    g1 = torch.cat(gen_s1, dim=1)  # (B, H)
+    g1 = torch.cat(gen_s1, dim=1)
     g2 = torch.cat(gen_s2, dim=1)
-    prices_norm = tokenizer.decode([g1, g2], half=True)  # (B, H, 6) normalized
+    prices_norm = tokenizer.decode([g1, g2], half=True)
     prices = prices_norm.float() * (x_std.unsqueeze(1) + 1e-5) + x_mean.unsqueeze(1)
     return prices
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ACF² loss
-# ─────────────────────────────────────────────────────────────────────────────
 
 def acf2_loss(
-    pred_prices: torch.Tensor,  # (B, H, 6)
-    true_close: torch.Tensor,   # (B, H)
+    pred_prices: torch.Tensor,
+    true_close: torch.Tensor,
     k_train: int,
     tau_lag: float,
     eps: float = 1e-8,
@@ -273,11 +256,11 @@ def acf2_loss(
     adaptive_k: bool = False,
     k_max: int = 10,
     w_floor: float = 0.02,
-    adaptive_prior_tau: float = 0.0,   # >0: multiply adaptive weight by exp(-k/tau) → bias toward low lags
-    adaptive_mode: str = 'discrepancy',  # 'discrepancy' | 'target' (w_k ∝ |true_ρ_k|, enforce where signal is)
-    over_penalty: float = 1.0,         # >1: penalise over-shoot (pred_ρ>true_ρ) harder → fight over-clustering
-    pooled: bool = False,              # aggregate form: True=POOLED (global-centred, one ACF over B×T, unbiased)
-) -> torch.Tensor:                     #                 vs default mean-of-per-window (finite-sample biased −1/T)
+    adaptive_prior_tau: float = 0.0,
+    adaptive_mode: str = 'discrepancy',
+    over_penalty: float = 1.0,
+    pooled: bool = False,
+) -> torch.Tensor:
     """
     Weighted MSE between predicted and true ACF of squared log-returns.
 
@@ -288,10 +271,10 @@ def acf2_loss(
       Averaging the ACF over the batch before squaring cancels the per-window estimation noise, so the
       gradient targets the ensemble clustering LEVEL (the aggregate metric) rather than per-path noise.
     """
-    pred_close = pred_prices[:, :, 3].clamp(min=eps)  # (B, H)
+    pred_close = pred_prices[:, :, 3].clamp(min=eps)
     true_close = true_close.clamp(min=eps)
 
-    pred_lr = torch.diff(torch.log(pred_close), dim=-1)  # (B, H-1)
+    pred_lr = torch.diff(torch.log(pred_close), dim=-1)
     true_lr = torch.diff(torch.log(true_close), dim=-1)
 
     pred_sq = pred_lr ** 2
@@ -304,12 +287,8 @@ def acf2_loss(
     pred_denom = (pred_sq_c ** 2).sum(dim=-1).clamp(min=eps)
     true_denom = (true_sq_c ** 2).sum(dim=-1).clamp(min=eps)
 
-    # ── POOLED aggregate: one ACF over the whole batch, centred by the GLOBAL mean (not per-window).
-    # Mean-of-per-window ρ keeps the finite-sample bias −1/T (each window normalised by its own noisy
-    # mean over only T points → at short H the bias dominates and can flip the sign of the target). Pooling
-    # numerators/denominators across all B windows gives effective T=B·(H−1) → bias ≈ 0, an unbiased target.
     if pooled and not adaptive_k:
-        pgc = pred_sq - pred_sq.mean()           # global centring (scalar mean over all B×T)
+        pgc = pred_sq - pred_sq.mean()
         tgc = true_sq - true_sq.mean()
         pden = (pgc ** 2).sum().clamp(min=eps)
         tden = (tgc ** 2).sum().clamp(min=eps)
@@ -321,9 +300,6 @@ def acf2_loss(
             loss = loss + w_k * (prho - trho) ** 2
         return loss
 
-    # ── Adaptive-K (hybrid scheme): weights adapt per batch to the current mis-fit, so the method
-    # self-selects which lags to enforce instead of a fixed k_train cutoff. w_k ∝ |Δρ_k| / (σ_k+ε)
-    # (discrepancy-focused + SNR-penalised), DETACHED so w is a weight, not a path the model can game.
     if adaptive_k:
         Kx = min(k_max, T - 1)
         pm, tm, sq_err, dsc, snr = [], [], [], [], []
@@ -333,11 +309,9 @@ def acf2_loss(
             if aggregate:
                 d = pak.mean() - tak.mean()
                 se = d ** 2
-                if over_penalty != 1.0 and d.detach() > 0:  # pred over true → over-cluster
+                if over_penalty != 1.0 and d.detach() > 0:
                     se = se * over_penalty
                 sq_err.append(se)
-                # weight: 'target' enforces where true clustering EXISTS (ignores true≈0 lags, no noise-chasing);
-                # 'discrepancy' focuses where the current fit is worst.
                 dsc.append(tak.detach().abs().mean() if adaptive_mode == 'target' else d.detach().abs())
                 snr.append(tak.detach().std() + eps)
             else:
@@ -349,13 +323,11 @@ def acf2_loss(
                 dsc.append(tak.detach().abs().mean() if adaptive_mode == 'target'
                            else diff.detach().abs().mean())
                 snr.append(tak.detach().std() + eps)
-        # optional low-lag prior: exp(-k/tau) biases weight toward low lags (cleaner clustering signal),
-        # curbing the first version's tendency to over-emphasise noisy high lags → over-clustering.
         prior = [math.exp(-(k) / adaptive_prior_tau) if adaptive_prior_tau > 0 else 1.0
                  for k in range(1, Kx + 1)]
-        raw = torch.stack([p * d / s for p, d, s in zip(prior, dsc, snr)])  # (Kx,) detached
+        raw = torch.stack([p * d / s for p, d, s in zip(prior, dsc, snr)])
         w = raw / (raw.sum() + eps)
-        w = torch.clamp(w, min=w_floor); w = w / w.sum()              # floor so no lag fully off
+        w = torch.clamp(w, min=w_floor); w = w / w.sum()
         return torch.stack(sq_err).mul(w).sum()
 
     loss = pred_prices.new_zeros(())
@@ -371,8 +343,8 @@ def acf2_loss(
 
 
 def directional_loss(
-    pred_prices: torch.Tensor,  # (B, H, 6)
-    true_close: torch.Tensor,   # (B, H)
+    pred_prices: torch.Tensor,
+    true_close: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
@@ -391,7 +363,7 @@ def directional_loss(
     """
     pred_close = pred_prices[:, :, 3].clamp(min=eps)
     true_close = true_close.clamp(min=eps)
-    pred_lr = torch.diff(torch.log(pred_close), dim=-1)  # (B, H-1)
+    pred_lr = torch.diff(torch.log(pred_close), dim=-1)
     true_lr = torch.diff(torch.log(true_close), dim=-1)
     s = true_lr.std().detach().clamp(min=eps)
     return (1.0 - torch.tanh(pred_lr / s) * torch.tanh(true_lr / s)).mean()
@@ -423,13 +395,10 @@ def stylized_fact_loss(pred_prices, true_close, eps=1e-8):
     return l_lev, l_kurt, l_var
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Gumbel temperature annealing
-# ─────────────────────────────────────────────────────────────────────────────
 
 def gumbel_tau(step: int, total_steps: int, tau_start: float, tau_end: float) -> float:
     frac = min(step / max(total_steps, 1), 1.0)
-    return tau_start * (tau_end / tau_start) ** frac  # geometric anneal
+    return tau_start * (tau_end / tau_start) ** frac
 
 
 def scheduled_p_self(step: int, total_steps: int, warmup_frac: float, p_max: float) -> float:
@@ -437,9 +406,6 @@ def scheduled_p_self(step: int, total_steps: int, warmup_frac: float, p_max: flo
     return min(step / max(warmup, 1), 1.0) * p_max
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-epoch eval helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parkinson_rv(high: np.ndarray, low: np.ndarray, eps: float = 1e-16) -> float:
     """Parkinson realized variance: sum (log H/L)^2 / (4 ln 2)."""
@@ -501,12 +467,12 @@ def eval_val(
     model.eval()
     tokenizer.eval()
 
-    K_eval = 15  # matches phase 1 eval config
+    K_eval = 15
 
     pred_acf_all, true_acf_all = [], []
     pred_rv_all, true_rv_all = [], []
     pred_ret_all, true_ret_all = [], []
-    price_ic_path_all, price_rankic_path_all = [], []  # path-shape (Table 14)
+    price_ic_path_all, price_rankic_path_all = [], []
 
     autocast_ctx = torch.amp.autocast('cuda', dtype=torch.float16)
 
@@ -524,21 +490,19 @@ def eval_val(
         x_std  = batch['x_std'].to(device)
         B, H = x_norm.shape[0], y_raw.shape[1]
 
-        # Tokenize full sequence (same as training loop)
         y_norm = torch.clamp(
             (y_raw - x_mean.unsqueeze(1)) / (x_std.unsqueeze(1) + 1e-5),
             -cfg.clip, cfg.clip,
         )
         full_seq_norm = torch.cat([x_norm, y_norm], dim=1)
-        tok_s1, tok_s2 = tokenizer.encode(full_seq_norm, half=True)  # (B, L+H)
+        tok_s1, tok_s2 = tokenizer.encode(full_seq_norm, half=True)
 
-        full_stamp = torch.cat([x_stamp, y_stamp], dim=1)  # (B, L+H, 5)
-        token_in_s1 = tok_s1[:, :-1]   # (B, L+H-1)
+        full_stamp = torch.cat([x_stamp, y_stamp], dim=1)
+        token_in_s1 = tok_s1[:, :-1]
         token_in_s2 = tok_s2[:, :-1]
 
         with autocast_ctx:
             s1_logits, s2_logits = model(token_in_s1, token_in_s2, full_stamp[:, :-1])
-        # Slice logits for prediction window only (last H positions)
         H = cfg.pred_len
         with autocast_ctx:
             pred_s1_logits = s1_logits[:, -H:, :]
@@ -549,7 +513,7 @@ def eval_val(
             pred_prices = (pred_prices_norm.float() * (x_std.unsqueeze(1) + 1e-5)
                            + x_mean.unsqueeze(1))
 
-        pred_np = pred_prices.cpu().numpy()   # (B, H, 6)
+        pred_np = pred_prices.cpu().numpy()
         true_np = y_raw.cpu().numpy()
 
         for i in range(B):
@@ -569,8 +533,6 @@ def eval_val(
             pred_ret_all.append(float(pred_close[-1] / max(pred_close[0], 1e-16) - 1))
             true_ret_all.append(float(true_close[-1] / max(true_close[0], 1e-16) - 1))
 
-            # Path-shape Price IC/RankIC — matches test Metric 2 (paper Table 14):
-            # OHLC-channel-averaged Pearson of pred vs true path over the H bars.
             pic = price_channel_ic(pred_np[i], true_np[i], rank=False)
             pric = price_channel_ic(pred_np[i], true_np[i], rank=True)
             if np.isfinite(pic):
@@ -578,7 +540,7 @@ def eval_val(
             if np.isfinite(pric):
                 price_rankic_path_all.append(pric)
 
-    pred_acf = np.array(pred_acf_all)   # (N, K)
+    pred_acf = np.array(pred_acf_all)
     true_acf = np.array(true_acf_all)
     diff = pred_acf - true_acf
     acf2_gap = float(np.mean(diff ** 2))
@@ -601,11 +563,10 @@ def eval_val(
     except Exception:
         rank_ic = float('nan')
     try:
-        price_ic = float(_pearson_np(pred_ret, true_ret))  # raw Pearson (price IC proxy)
+        price_ic = float(_pearson_np(pred_ret, true_ret))
     except Exception:
         price_ic = float('nan')
 
-    # Path-shape Price IC/RankIC — the metric we actually report on test (Table 14).
     price_ic_path = float(np.mean(price_ic_path_all)) if price_ic_path_all else float('nan')
     price_rankic_path = (float(np.mean(price_rankic_path_all))
                          if price_rankic_path_all else float('nan'))
@@ -613,17 +574,17 @@ def eval_val(
     return {
         'acf2_gap': acf2_gap,
         'parkinson_r2': park_r2,
-        'price_rankic': rank_ic,        # OLD end-of-window return proxy (kept for continuity)
-        'price_ic': price_ic,           # OLD end-of-window return proxy
-        'price_ic_path': price_ic_path,         # NEW: path-shape, matches test Table 14
-        'price_rankic_path': price_rankic_path,  # NEW: path-shape, selection metric
+        'price_rankic': rank_ic,
+        'price_ic': price_ic,
+        'price_ic_path': price_ic_path,
+        'price_rankic_path': price_rankic_path,
         'n_windows': len(pred_acf_all),
     }
 
 
 @torch.no_grad()
 def eval_val_ar(
-    model: torch.nn.Module,    # underlying Kronos module
+    model: torch.nn.Module,
     tokenizer: KronosTokenizer,
     val_loader: DataLoader,
     cfg: Phase2Config,
@@ -639,10 +600,9 @@ def eval_val_ar(
     tokenizer.eval()
     K_eval = 15
     pred_acf_all, true_acf_all = [], []
-    pic_path_all, pric_path_all = [], []      # path-shape price IC / RankIC (Table 14)
-    pred_ret_all, true_ret_all = [], []       # end-of-window return proxies (return IC/RankIC)
-    mse_rel_all = []                          # own val loss for the MSE-AR arm's checkpoint selection
-    # single-element lists so the inner loop can accumulate without `nonlocal`
+    pic_path_all, pric_path_all = [], []
+    pred_ret_all, true_ret_all = [], []
+    mse_rel_all = []
     n_roll_all, n_neg_all, n_s2gt1_all, s2_max_all = [0], [0], [0], [0.0]
 
     nb = 0
@@ -664,10 +624,6 @@ def eval_val_ar(
         true_np = y_raw.cpu().numpy()
         for i in range(pred_np.shape[0]):
             pc, tc = pred_np[i, :, 3], true_np[i, :, 3]
-            # Rollout stability, measured on the SAME rollouts the selection metric is computed
-            # from. acf2_gap is a correlation: bounded and scale-invariant, so a rollout that runs
-            # off to sigma^2 ~ 1e3 still contributes a bounded value and the selection signal cannot
-            # see it. These two counters are the part it is blind to.
             n_roll_all[0] += 1
             if float(np.min(pc)) <= 0:
                 n_neg_all[0] += 1
@@ -690,9 +646,6 @@ def eval_val_ar(
 
     pred_acf_arr, true_acf_arr = np.array(pred_acf_all), np.array(true_acf_all)
     diff = pred_acf_arr - true_acf_arr
-    # AGGREGATE ACF gap: average each lag's ACF over windows FIRST, then weighted squared gap. This
-    # cancels the finite-sample (31-return) estimation noise that dominates the per-window acf2_gap_ar,
-    # giving a lower-variance checkpoint-selection signal (see PLAN §AGGREGATE-ACF). w_k = exp(-k/2).
     w_agg = np.exp(-np.arange(1, K_eval + 1) / 2.0)
     acf2_gap_ar_agg = float((w_agg * (pred_acf_arr.mean(0) - true_acf_arr.mean(0)) ** 2).sum())
     pred_ret, true_ret = np.array(pred_ret_all), np.array(true_ret_all)
@@ -709,7 +662,6 @@ def eval_val_ar(
         'return_ic_ar': ret_ic,
         'return_rankic_ar': ret_rankic,
         'n_windows_ar': len(pred_acf_all),
-        # val-rollout stability (see comment in the loop above)
         'val_pct_neg_ar': 100.0 * n_neg_all[0] / max(n_roll_all[0], 1),
         'val_pct_s2gt1_ar': 100.0 * n_s2gt1_all[0] / max(n_roll_all[0], 1),
         'val_max_s2_ar': s2_max_all[0],
@@ -717,9 +669,6 @@ def eval_val_ar(
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Training loop
-# ─────────────────────────────────────────────────────────────────────────────
 
 def train(
     model: DDP,
@@ -730,7 +679,7 @@ def train(
     save_dir: Path,
     rank: int,
     device: torch.device,
-    val_loader2: DataLoader = None,   # thread A: optional 2nd CV fold
+    val_loader2: DataLoader = None,
 ) -> dict:
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -739,10 +688,6 @@ def train(
         weight_decay=cfg.weight_decay,
     )
     total_steps = len(train_loader) * cfg.epochs
-    # OneCycleLR advances once per OPTIMISER step, which under accumulation is one
-    # per grad_accum micro-batches. Sizing it with the micro-batch count would leave
-    # the cycle unfinished (LR never anneals). gumbel_tau / the lambda ramp stay on
-    # micro-batch units via global_step, so their semantics are unchanged.
     sched_steps = max(1, (len(train_loader) // cfg.grad_accum) * cfg.epochs)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=cfg.lr,
@@ -750,11 +695,9 @@ def train(
         pct_start=0.03, div_factor=10,
     )
 
-    # V100 uses FP16 (not bfloat16)
     scaler = torch.amp.GradScaler('cuda')
     autocast_ctx = torch.amp.autocast('cuda', dtype=torch.float16)
 
-    # optional Weights & Biases logging (rank 0 only; fail-safe — never breaks a run)
     wb = None
     if rank == 0 and getattr(cfg, 'use_wandb', False):
         try:
@@ -767,15 +710,14 @@ def train(
             print(f"[wandb] disabled ({e})")
 
     best_acf2_gap = float('inf')
-    best_price_rankic = float('-inf')  # thread B: select by path-shape val Price RankIC (Table 14)
-    best_acf2_gap_ar = float('inf')    # AR val selection: autoregressive val acf2_gap (matches test)
-    best_arval_pw = float('inf')       # AR per-window-selected checkpoint (for the val-selection ablation)
-    best_arval_agg = float('inf')      # AR aggregate-selected checkpoint (for the val-selection ablation)
-    best_valown = float('inf')         # MSE-AR arm selected on its own val loss (mse_rel_ar), not acf2_gap_ar_agg
+    best_price_rankic = float('-inf')
+    best_acf2_gap_ar = float('inf')
+    best_arval_pw = float('inf')
+    best_arval_agg = float('inf')
     history = []
     global_step = 0
     t0 = time.time()
-    ema_lambda = cfg.lambda_acf  # A3: starts at lambda_acf (10.0), adapts each interval
+    ema_lambda = cfg.lambda_acf
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -784,51 +726,40 @@ def train(
         ep_ce_loss = 0.0
         ep_acf_loss = 0.0
         ep_batches = 0
-        # micro-batches accumulated so far toward the current optimizer step.
-        # Reset per epoch: a partial tail is dropped rather than stepped on a
-        # short accumulation, which would be a differently-weighted update.
         accum_n = 0
 
         for batch in train_loader:
-            x_norm = batch['x_norm'].to(device, non_blocking=True)    # (B, L, 6)
-            y_raw = batch['y_raw'].to(device, non_blocking=True)       # (B, H, 6)
-            x_stamp = batch['x_stamp'].to(device, non_blocking=True)   # (B, L, 5)
-            y_stamp = batch['y_stamp'].to(device, non_blocking=True)   # (B, H, 5)
-            x_mean = batch['x_mean'].to(device, non_blocking=True)     # (B, 6)
-            x_std = batch['x_std'].to(device, non_blocking=True)       # (B, 6)
+            x_norm = batch['x_norm'].to(device, non_blocking=True)
+            y_raw = batch['y_raw'].to(device, non_blocking=True)
+            x_stamp = batch['x_stamp'].to(device, non_blocking=True)
+            y_stamp = batch['y_stamp'].to(device, non_blocking=True)
+            x_mean = batch['x_mean'].to(device, non_blocking=True)
+            x_std = batch['x_std'].to(device, non_blocking=True)
 
             B, L, _ = x_norm.shape
             H = cfg.pred_len
-            full_stamp = torch.cat([x_stamp, y_stamp], dim=1)  # (B, L+H, 5)
+            full_stamp = torch.cat([x_stamp, y_stamp], dim=1)
 
-            # Tokenize full sequence with frozen tokenizer (no autocast: indices must be int)
             with torch.no_grad():
                 y_norm = torch.clamp(
                     (y_raw - x_mean.unsqueeze(1)) / (x_std.unsqueeze(1) + 1e-5),
                     -cfg.clip, cfg.clip,
                 )
                 full_seq_norm = torch.cat([x_norm, y_norm], dim=1)
-                tok_s1, tok_s2 = tokenizer.encode(full_seq_norm, half=True)  # (B, L+H)
+                tok_s1, tok_s2 = tokenizer.encode(full_seq_norm, half=True)
 
-            token_in_s1 = tok_s1[:, :-1]   # (B, L+H-1)
+            token_in_s1 = tok_s1[:, :-1]
             token_in_s2 = tok_s2[:, :-1]
             token_out_s1 = tok_s1[:, 1:]
             token_out_s2 = tok_s2[:, 1:]
 
             if cfg.rollout_mode == 'full_ar':
-                # ── Full differentiable AR rollout path ───────────────────────
-                # The rollout runs many predictor passes via model.module, so we do
-                # NOT call DDP.forward (its reducer can't track the multi-pass graph).
-                # Grads are therefore local → averaged across ranks manually below.
                 mod = model.module
                 with autocast_ctx:
                     s1_logits, s2_logits = mod(token_in_s1, token_in_s2, full_stamp[:, :-1])
                     loss_ce, _, _ = mod.head.compute_loss(
                         s1_logits, s2_logits, token_out_s1, token_out_s2,
                     )
-                # AR rollout in FP32: the H-step recurrent graph overflows in fp16
-                # (Gumbel÷tau amplifies, compounds over 32 steps → inf → nan logits →
-                # multinomial assert). CE above stays fp16; only the deep rollout needs fp32.
                 tau = gumbel_tau(global_step, total_steps,
                                  cfg.gumbel_tau_start, cfg.gumbel_tau_end)
                 with torch.amp.autocast('cuda', enabled=False):
@@ -846,10 +777,6 @@ def train(
                                          pooled=getattr(cfg, 'acf_pooled', False))
                     loss_dir = (directional_loss(pred_prices, y_raw[:, :, 3].float())
                                 if cfg.lambda_dir > 0.0 else pred_prices.new_zeros(()))
-                # ── adaptive λ (gradient-norm balancing) in the full_ar path ──────
-                # Every grad_norm_interval steps, set λ so ‖∇ACF²‖ ≈ alpha_grad·‖∇CE‖ (target 7% of CE),
-                # EMA-smoothed. Proxy = head params (cheap). Removes per-dataset λ tuning: λ self-calibrates
-                # to the dataset's CE/ACF² gradient ratio. Fail-safe: any error keeps the current ema_lambda.
                 if cfg.adaptive_lambda and (global_step % cfg.grad_norm_interval == 0):
                     try:
                         proxy = [p for p in mod.head.parameters() if p.requires_grad]
@@ -859,34 +786,24 @@ def train(
                         gan = float(torch.sqrt(sum((g.detach()**2).sum() for g in ga if g is not None)))
                         if gan > 1e-12:
                             lam_inst = cfg.alpha_grad * gcn / gan
-                            lam_inst = float(np.clip(lam_inst, 0.5, 50.0))  # sane band
+                            lam_inst = float(np.clip(lam_inst, 0.5, 50.0))
                             ema_lambda = cfg.ema_lambda_beta * ema_lambda + (1 - cfg.ema_lambda_beta) * lam_inst
                     except Exception as e:
                         if global_step == 0 and rank == 0:
                             print(f"[adaptive-λ] disabled ({e})")
-                # scheduled λ (warmup ramps 0→λ_acf over warmup_frac of steps; else constant)
                 lam_acf = ema_lambda if cfg.adaptive_lambda else cfg.lambda_acf
                 if cfg.lambda_schedule == 'warmup':
                     ramp = max(1, int(cfg.warmup_frac * total_steps))
                     lam_acf = cfg.lambda_acf * min(1.0, global_step / ramp)
                 if cfg.lambda_dir > 0.0 and cfg.dir_mode == 'mult':
-                    # multiplicative: the ACF² term is *scaled* by directional disagreement, so
-                    # ACF credit is only granted where the sign is already right. Both factors are
-                    # >= 0 and both are minimised, so there is no way to game one by inflating the
-                    # other. Coupling cuts both ways: as ACF² -> 0 the directional gradient
-                    # (∝ λ_acf·ACF²·λ_dir) vanishes, so this applies weaker sign pressure than
-                    # 'add' at equal λ_dir — expect to need a larger λ_dir here.
                     loss = loss_ce.float() + lam_acf * loss_acf * (1.0 + cfg.lambda_dir * loss_dir)
                 else:
-                    # additive: independent sign pressure, constant regardless of ACF² progress
                     loss = loss_ce.float() + lam_acf * loss_acf + cfg.lambda_dir * loss_dir
-                # optional MSE ablation: relative squared error of the predicted close path
                 if cfg.lambda_mse > 0.0:
                     true_close = y_raw[:, :, 3].float().clamp_min(1e-6)
-                    pred_close = pred_prices[:, :, 3].float()          # (B,H,6) -> close channel
+                    pred_close = pred_prices[:, :, 3].float()
                     loss_mse = ((pred_close / true_close - 1.0) ** 2).mean()
                     loss = loss + cfg.lambda_mse * loss_mse
-                # B — extra stylized facts (leverage / kurtosis / variance-dispersion)
                 if (getattr(cfg, 'lambda_lev', 0.0) + getattr(cfg, 'lambda_kurt', 0.0)
                         + getattr(cfg, 'lambda_var', 0.0)) > 0.0:
                     l_lev, l_kurt, l_var = stylized_fact_loss(pred_prices, y_raw[:, :, 3].float())
@@ -896,9 +813,6 @@ def train(
 
                 if accum_n == 0:
                     optimizer.zero_grad()
-                # skip a non-finite batch: a NaN/Inf loss (e.g. an extreme US-equity window through the
-                # AR rollout) would backprop NaN into the weights and permanently diverge the run.
-                # DDP-safe: if ANY rank is non-finite, ALL ranks skip (else the all-reduce below hangs).
                 finite = torch.tensor(float(torch.isfinite(loss)), device=loss.device)
                 if dist.is_initialized() and dist.get_world_size() > 1:
                     dist.all_reduce(finite, op=dist.ReduceOp.MIN)
@@ -906,33 +820,36 @@ def train(
                     if rank == 0:
                         print(f"  [skip] non-finite loss at ep{epoch+1} step {global_step} — batch dropped")
                     continue
-                # /grad_accum so the accumulated gradient is a MEAN over micro-batches,
-                # matching what a single batch of that size would produce for the CE term.
                 scaler.scale(loss / cfg.grad_accum).backward()
                 accum_n += 1
                 if accum_n >= cfg.grad_accum:
                     accum_n = 0
                     scaler.unscale_(optimizer)
-                    # manual gradient all-reduce (DDP.forward was bypassed)
                     ws = dist.get_world_size()
                     if ws > 1:
                         for p in mod.parameters():
                             if p.grad is not None:
                                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                                 p.grad.div_(ws)
-                    torch.nn.utils.clip_grad_norm_(mod.parameters(), cfg.grad_clip)
-                    scaler.step(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(mod.parameters(), cfg.grad_clip)
+                    grad_finite = torch.tensor(float(torch.isfinite(grad_norm)), device=loss.device)
+                    if ws > 1:
+                        dist.all_reduce(grad_finite, op=dist.ReduceOp.MIN)
+                    if grad_finite.item() < 0.5:
+                        if rank == 0:
+                            print(f"  [skip] non-finite grad at ep{epoch+1} step {global_step} — update dropped")
+                        optimizer.zero_grad()
+                    else:
+                        scaler.step(optimizer)
                     scaler.update()
                     scheduler.step()
             else:
                 with autocast_ctx:
-                    # ── CE loss (teacher-forced) ──────────────────────────────
                     s1_logits, s2_logits = model(token_in_s1, token_in_s2, full_stamp[:, :-1])
                     loss_ce, _, _ = model.module.head.compute_loss(
                         s1_logits, s2_logits, token_out_s1, token_out_s2,
                     )
 
-                    # ── ACF² loss (A2 / A3) ──────────────────────────────────
                     loss_acf = x_norm.new_zeros(())
                     if cfg.arm in ('A2', 'A3'):
                         tau = gumbel_tau(global_step, total_steps,
@@ -953,10 +870,6 @@ def train(
                                              over_penalty=getattr(cfg, 'over_penalty', 1.0),
                                              pooled=getattr(cfg, 'acf_pooled', False))
 
-                # ── A3: adaptive λ via gradient-norm proxy on head parameters ─
-                # Update EMA of λ every grad_norm_interval steps using autograd.grad
-                # on the prediction head (cheap proxy for full-model gradient norms).
-                # retain_graph=True keeps the graph intact for the main backward pass.
                 if cfg.arm == 'A3' and global_step % cfg.grad_norm_interval == 0:
                     proxy = [p for p in model.module.head.parameters() if p.requires_grad]
                     if proxy and loss_acf.item() > 1e-10:
@@ -1020,21 +933,19 @@ def train(
                             'train/loss': loss.item(), 'train/lr': lr, 'epoch': epoch + 1},
                            step=global_step)
 
-        # ── end of epoch ─────────────────────────────────────────────────────
         if rank == 0:
             avg_ce = ep_ce_loss / max(ep_batches, 1)
             avg_acf = ep_acf_loss / max(ep_batches, 1)
             elapsed = format_time(time.time() - t0)
 
             val_metrics = eval_val(model.module, tokenizer, val_loader, cfg, device,
-                                   max_batches=cfg.val_ar_max_batches)  # full val (selection on full set)
+                                   max_batches=cfg.val_ar_max_batches)
             acf2_gap = val_metrics['acf2_gap']
             if wb is not None:
                 wb.log({f'val/{k}': v for k, v in val_metrics.items()
                         if isinstance(v, (int, float))}, step=global_step)
                 wb.log({'train/epoch_CE': avg_ce, 'train/epoch_ACF2': avg_acf}, step=global_step)
 
-            # thread A: 2-fold CV — select by MEAN acf2_gap across folds
             sel_acf2 = acf2_gap
             if val_loader2 is not None:
                 val_metrics2 = eval_val(model.module, tokenizer, val_loader2, cfg, device)
@@ -1044,8 +955,6 @@ def train(
                 val_metrics['acf2_gap_mean'] = sel_acf2
                 val_metrics['acf2_gap_worst'] = max(acf2_gap, acf2_gap2)
 
-            # AR val selection: autoregressive (greedy) val metrics matching the test
-            # generation procedure — fixes the teacher-forced-vs-autoregressive measurement gap.
             if cfg.ar_val_select:
                 ar_metrics = eval_val_ar(model.module, tokenizer, val_loader, cfg, device,
                                          max_batches=cfg.val_ar_max_batches)
@@ -1069,14 +978,10 @@ def train(
                       f"return_ic_ar={val_metrics['return_ic_ar']:.4f}  "
                       f"return_rankic_ar={val_metrics['return_rankic_ar']:.4f}  "
                       f"mse_rel_ar={val_metrics['mse_rel_ar']:.6f}")
-                # The selection metrics above are bounded correlations and cannot see a rollout
-                # that diverges; these can. Logged for every arm so the gate below, if ever
-                # enabled, rests on a signal already recorded across all of them.
                 print(f"  val(AR) stability: pct_close<=0={val_metrics['val_pct_neg_ar']:.3f}%  "
                       f"pct_sigma2>1={val_metrics['val_pct_s2gt1_ar']:.3f}%  "
                       f"max_sigma2={val_metrics['val_max_s2_ar']:.4g}")
 
-            # early stopping checks
             if val_metrics['price_rankic'] < cfg.rankic_baseline * (1 - cfg.rankic_drop_tol):
                 print(f"  [WARN] RankIC {val_metrics['price_rankic']:.4f} dropped >10% below "
                       f"baseline {cfg.rankic_baseline:.4f} — consider stopping")
@@ -1094,8 +999,6 @@ def train(
                 ep_record['lambda_ema'] = ema_lambda
             history.append(ep_record)
 
-            # save best by acf2_gap (primary criterion). Thread A CV: sel_acf2 is the
-            # mean across folds; single-fold runs: sel_acf2 == acf2_gap.
             if sel_acf2 < best_acf2_gap:
                 best_acf2_gap = sel_acf2
                 ckpt = save_dir / 'best_model'
@@ -1103,7 +1006,6 @@ def train(
                 tag = 'acf2_mean' if val_loader2 is not None else 'acf2_gap'
                 print(f"  [save] best model → {ckpt}  ({tag}={best_acf2_gap:.5f})")
 
-            # thread B: also save best by path-shape val Price RankIC (matches test Table 14)
             price_rankic_path = val_metrics['price_rankic_path']
             if np.isfinite(price_rankic_path) and price_rankic_path > best_price_rankic:
                 best_price_rankic = price_rankic_path
@@ -1112,33 +1014,23 @@ def train(
                 print(f"  [save] best price_rankic model → {ckpt_r}  "
                       f"(price_rankic_path={best_price_rankic:.5f})")
 
-            # AR val selection (matches the AR test metric, unlike the teacher-forced best_model).
-            # Save BOTH criteria as separate checkpoints so per-window vs aggregate selection can be
-            # compared cleanly on the SAME training run (isolates the selection choice from run variance).
             gated = cfg.val_stability_gate and val_metrics['val_pct_neg_ar'] > 0
             if gated:
                 print(f"  [gate] epoch not eligible for checkpointing — val rollouts produced "
                       f"non-positive close ({val_metrics['val_pct_neg_ar']:.3f}%)")
             if cfg.ar_val_select and not gated:
                 sel_key = 'acf2_gap_ar_agg' if cfg.val_select_agg else 'acf2_gap_ar'
-                if val_metrics[sel_key] < best_acf2_gap_ar:      # legacy: the configured single choice
+                if val_metrics[sel_key] < best_acf2_gap_ar:
                     best_acf2_gap_ar = val_metrics[sel_key]
                     model.module.save_pretrained(str(save_dir / 'best_arval_model'))
                     print(f"  [save] best AR-val model  ({sel_key}={best_acf2_gap_ar:.5f})")
-                if val_metrics['acf2_gap_ar'] < best_arval_pw:   # per-window-AR selected
+                if val_metrics['acf2_gap_ar'] < best_arval_pw:
                     best_arval_pw = val_metrics['acf2_gap_ar']
                     model.module.save_pretrained(str(save_dir / 'best_arval_pw_model'))
-                if val_metrics['acf2_gap_ar_agg'] < best_arval_agg:  # aggregate-AR selected
+                if val_metrics['acf2_gap_ar_agg'] < best_arval_agg:
                     best_arval_agg = val_metrics['acf2_gap_ar_agg']
                     model.module.save_pretrained(str(save_dir / 'best_arval_agg_model'))
-                # MSE-AR arm doesn't optimize ACF² (lambda_acf=0), so acf2_gap is not a meaningful
-                # selection signal for it — select by its own val loss (mse_rel_ar) instead.
-                if cfg.lambda_mse > 0.0 and val_metrics['mse_rel_ar'] < best_valown:
-                    best_valown = val_metrics['mse_rel_ar']
-                    model.module.save_pretrained(str(save_dir / 'best_valown_model'))
-                    print(f"  [save] best val-own-loss model  (mse_rel_ar={best_valown:.6f})")
 
-            # save every epoch's checkpoint (for oracle test-epoch selection studies)
             if getattr(cfg, 'save_all_epochs', False):
                 ckpt_e = save_dir / f'epoch_{epoch + 1}'
                 model.module.save_pretrained(str(ckpt_e))
@@ -1154,9 +1046,6 @@ def train(
             'best_acf2_gap_ar': best_acf2_gap_ar, 'history': history}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main(cfg: Phase2Config):
     rank, world_size, local_rank = setup_ddp()
@@ -1168,7 +1057,6 @@ def main(cfg: Phase2Config):
         save_dir.mkdir(parents=True, exist_ok=True)
         import dataclasses, subprocess
         cfg_d = dataclasses.asdict(cfg)
-        # tie the run to the exact code version for future verifiability
         try:
             cfg_d['git_commit'] = subprocess.check_output(
                 ['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).parent,
@@ -1177,14 +1065,12 @@ def main(cfg: Phase2Config):
             cfg_d['git_commit'] = 'unknown'
         with open(save_dir / 'config.json', 'w') as f:
             json.dump(cfg_d, f, indent=2)
-        # echo the identity to STDOUT so it lands in log_output/ (greppable without touching scratch)
         print(f"[RUN-CONFIG] run={cfg.run_name} arm={cfg.arm} pred_len={cfg.pred_len} "
               f"lookback={cfg.lookback} stride={cfg.stride} lambda_acf={cfg.lambda_acf} "
               f"k_train={cfg.k_train} lambda_mse={getattr(cfg,'lambda_mse',0.0)} "
               f"data_fraction={cfg.data_fraction} data_dir={cfg.data_dir} freq={cfg.frequency} "
               f"git={cfg_d['git_commit'][:8]}", flush=True)
 
-    # ── data ──────────────────────────────────────────────────────────────────
     train_ds = CryptoWindowDataset(
         data_dir=cfg.data_dir, symbols=cfg.symbols,
         period_start=cfg.train_start, period_end=cfg.train_end,
@@ -1193,14 +1079,14 @@ def main(cfg: Phase2Config):
         data_fraction=cfg.data_fraction, frequency=cfg.frequency,
         data_select=getattr(cfg, 'data_select', None),
         acf_select_lags=getattr(cfg, 'acf_select_lags', 3),
-        data_select_seed=cfg.seed,  # rank-independent → same random subset on all DDP ranks
+        data_select_seed=cfg.seed,
     )
     val_ds = CryptoWindowDataset(
         data_dir=cfg.data_dir, symbols=cfg.symbols,
         period_start=cfg.val_start, period_end=cfg.val_end,
         lookback=cfg.lookback, pred_len=cfg.pred_len, stride=cfg.stride,
         clip=cfg.clip, zero_vol_amount=cfg.zero_vol_amount,
-        data_fraction=1.0, frequency=cfg.frequency,  # always use full val set
+        data_fraction=1.0, frequency=cfg.frequency,
     )
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
@@ -1215,7 +1101,6 @@ def main(cfg: Phase2Config):
         num_workers=cfg.num_workers, pin_memory=True, drop_last=False,
     )
 
-    # Thread A: optional 2nd val fold for cross-validation selection
     val_loader2 = None
     if cfg.val2_start and cfg.val2_end:
         val_ds2 = CryptoWindowDataset(
@@ -1231,7 +1116,6 @@ def main(cfg: Phase2Config):
             num_workers=cfg.num_workers, pin_memory=True, drop_last=False,
         )
 
-    # ── models ────────────────────────────────────────────────────────────────
     tokenizer = KronosTokenizer.from_pretrained(cfg.tokenizer_path)
     tokenizer.eval().to(device)
     for p in tokenizer.parameters():
@@ -1245,7 +1129,6 @@ def main(cfg: Phase2Config):
         print(f"[{cfg.run_name}] predictor: {get_model_size(predictor.module)}")
         print(f"[{cfg.run_name}] train windows: {len(train_ds)}, val windows: {len(val_ds)}")
 
-    # ── train ─────────────────────────────────────────────────────────────────
     result = train(predictor, tokenizer, train_loader, val_loader,
                    cfg, save_dir, rank, device, val_loader2=val_loader2)
 
@@ -1264,16 +1147,13 @@ if __name__ == '__main__':
                            "torchrun --standalone --nproc_per_node=N finetune/train_predictor.py --arm A1")
 
     parser = argparse.ArgumentParser()
-    # Valid names come from the preset table itself. They used to be a second,
-    # hand-maintained copy here, which silently rejected every preset added
-    # after the copy was last updated.
     parser.add_argument('--arm', default='A1', choices=arm_preset())
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--k_train', type=int, default=None)
     parser.add_argument('--lambda_acf', type=float, default=None)
     parser.add_argument('--tau_lag', type=float, default=None)
     parser.add_argument('--data_fraction', type=float, default=None)
-    parser.add_argument('--data_select', default=None)   # first | last | random | high_acf2 | low_acf2
+    parser.add_argument('--data_select', default=None)
     parser.add_argument('--data_select_seed', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--save_dir', default=None)

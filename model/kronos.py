@@ -52,24 +52,22 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
 
         self.s1_bits = s1_bits
         self.s2_bits = s2_bits
-        self.codebook_dim = s1_bits + s2_bits # Total dimension of the codebook after quantization
+        self.codebook_dim = s1_bits + s2_bits
         self.embed = nn.Linear(self.d_in, self.d_model)
         self.head = nn.Linear(self.d_model, self.d_in)
 
-        # Encoder Transformer Blocks
         self.encoder = nn.ModuleList([
             TransformerBlock(self.d_model, self.n_heads, self.ff_dim, self.ffn_dropout_p, self.attn_dropout_p, self.resid_dropout_p)
             for _ in range(self.enc_layers - 1)
         ])
-        # Decoder Transformer Blocks
         self.decoder = nn.ModuleList([
             TransformerBlock(self.d_model, self.n_heads, self.ff_dim, self.ffn_dropout_p, self.attn_dropout_p, self.resid_dropout_p)
             for _ in range(self.dec_layers - 1)
         ])
-        self.quant_embed = nn.Linear(in_features=self.d_model, out_features=self.codebook_dim) # Linear layer before quantization
-        self.post_quant_embed_pre = nn.Linear(in_features=self.s1_bits, out_features=self.d_model) # Linear layer after quantization (pre part - s1 bits)
-        self.post_quant_embed = nn.Linear(in_features=self.codebook_dim, out_features=self.d_model) # Linear layer after quantization (full codebook)
-        self.tokenizer = BSQuantizer(self.s1_bits, self.s2_bits, beta, gamma0, gamma, zeta, group_size) # BSQuantizer module
+        self.quant_embed = nn.Linear(in_features=self.d_model, out_features=self.codebook_dim)
+        self.post_quant_embed_pre = nn.Linear(in_features=self.s1_bits, out_features=self.d_model)
+        self.post_quant_embed = nn.Linear(in_features=self.codebook_dim, out_features=self.d_model)
+        self.tokenizer = BSQuantizer(self.s1_bits, self.s2_bits, beta, gamma0, gamma, zeta, group_size)
 
     def forward(self, x):
         """
@@ -91,21 +89,19 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         for layer in self.encoder:
             z = layer(z)
 
-        z = self.quant_embed(z) # (B, T, codebook)
+        z = self.quant_embed(z)
 
         bsq_loss, quantized, z_indices = self.tokenizer(z)
 
-        quantized_pre = quantized[:, :, :self.s1_bits] # Extract the first part of quantized representation (s1_bits)
+        quantized_pre = quantized[:, :, :self.s1_bits]
         z_pre = self.post_quant_embed_pre(quantized_pre)
 
         z = self.post_quant_embed(quantized)
 
-        # Decoder layers (for pre part - s1 bits)
         for layer in self.decoder:
             z_pre = layer(z_pre)
         z_pre = self.head(z_pre)
 
-        # Decoder layers (for full codebook)
         for layer in self.decoder:
             z = layer(z)
         z = self.head(z)
@@ -124,18 +120,18 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
             torch.Tensor: Bit representation tensor.
         """
         if half:
-            x1 = x[0] # Assuming x is a tuple of indices if half is True
+            x1 = x[0]
             x2 = x[1]
-            mask = 2 ** torch.arange(self.codebook_dim//2, device=x1.device, dtype=torch.long) # Create a mask for bit extraction
-            x1 = (x1.unsqueeze(-1) & mask) != 0 # Extract bits for the first half
-            x2 = (x2.unsqueeze(-1) & mask) != 0 # Extract bits for the second half
-            x = torch.cat([x1, x2], dim=-1) # Concatenate the bit representations
+            mask = 2 ** torch.arange(self.codebook_dim//2, device=x1.device, dtype=torch.long)
+            x1 = (x1.unsqueeze(-1) & mask) != 0
+            x2 = (x2.unsqueeze(-1) & mask) != 0
+            x = torch.cat([x1, x2], dim=-1)
         else:
-            mask = 2 ** torch.arange(self.codebook_dim, device=x.device, dtype=torch.long) # Create a mask for bit extraction
-            x = (x.unsqueeze(-1) & mask) != 0 # Extract bits
+            mask = 2 ** torch.arange(self.codebook_dim, device=x.device, dtype=torch.long)
+            x = (x.unsqueeze(-1) & mask) != 0
 
-        x = x.float() * 2 - 1 # Convert boolean to bipolar (-1, 1)
-        q_scale = 1. / (self.codebook_dim ** 0.5) # Scaling factor
+        x = x.float() * 2 - 1
+        q_scale = 1. / (self.codebook_dim ** 0.5)
         x = x * q_scale
         return x
 
@@ -267,17 +263,12 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         if use_teacher_forcing:
             sibling_embed = self.embedding.emb_s1(s1_targets)
         else:
-            # fp32 + nan/inf guard before sampling. Under fp16 autocast the s1 logits can overflow
-            # (AR-ACF²-trained weights carry larger magnitudes) → inf → softmax → nan probs →
-            # torch.multinomial fires a device-side assert ("probability tensor contains inf/nan")
-            # → SIGABRT, killing the run mid-training even though CE/ACF² are healthy. Detached
-            # path, so this changes no gradient and is a no-op when logits are finite.
             s1_safe = torch.nan_to_num(s1_logits.detach().float(), nan=0.0, posinf=30.0, neginf=-30.0)
             s1_probs = F.softmax(s1_safe, dim=-1)
             sample_s1_ids = torch.multinomial(s1_probs.view(-1, self.s1_vocab_size), 1).view(s1_ids.shape)
             sibling_embed = self.embedding.emb_s1(sample_s1_ids)
 
-        x2 = self.dep_layer(x, sibling_embed, key_padding_mask=padding_mask) # Dependency Aware Layer: Condition on s1 embeddings
+        x2 = self.dep_layer(x, sibling_embed, key_padding_mask=padding_mask)
         s2_logits = self.head.cond_forward(x2)
         return s1_logits, s2_logits
 
@@ -351,8 +342,7 @@ def top_k_top_p_filtering(
     From: https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
     """
     if top_k > 0:
-        top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))  # Safety check
-        # Remove all tokens with a probability less than the last token of the top-k
+        top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))
         indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
         logits[indices_to_remove] = filter_value
         return logits
@@ -361,16 +351,12 @@ def top_k_top_p_filtering(
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-        # Remove tokens with cumulative probability above the threshold (token with 0 are kept)
         sorted_indices_to_remove = cumulative_probs > top_p
         if min_tokens_to_keep > 1:
-            # Keep at least min_tokens_to_keep (set to min_tokens_to_keep-1 because we add the first one below)
             sorted_indices_to_remove[..., :min_tokens_to_keep] = 0
-        # Shift the indices to the right to keep also the first token above the threshold
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
 
-        # scatter sorted tensors to original indexing
         indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
         logits[indices_to_remove] = filter_value
         return logits
@@ -382,7 +368,6 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
         if top_k > 0 or top_p < 1.0:
             logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
 
-    # same guard as the training path: inf/nan logits would make multinomial assert (SIGABRT)
     logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=30.0, neginf=-30.0)
     probs = F.softmax(logits, dim=-1)
 
@@ -499,7 +484,6 @@ class KronosPredictor:
         self.amt_vol = 'amount'
         self.time_cols = ['minute', 'hour', 'weekday', 'day', 'month']
         
-        # Auto-detect device if not specified
         if device is None:
             if torch.cuda.is_available():
                 device = "cuda:0"
@@ -534,8 +518,8 @@ class KronosPredictor:
 
         df = df.copy()
         if self.vol_col not in df.columns:
-            df[self.vol_col] = 0.0  # Fill missing volume with zeros
-            df[self.amt_vol] = 0.0  # Fill missing amount with zeros
+            df[self.vol_col] = 0.0
+            df[self.amt_vol] = 0.0
         if self.amt_vol not in df.columns and self.vol_col in df.columns:
             df[self.amt_vol] = df[self.vol_col] * df[self.price_cols].mean(axis=1)
 
@@ -586,7 +570,6 @@ class KronosPredictor:
             List[pd.DataFrame]: List of prediction results in the same order as input, each DataFrame contains
                                 `open, high, low, close, volume, amount` columns, indexed by corresponding `y_timestamp`.
         """
-        # Basic validation
         if not isinstance(df_list, (list, tuple)) or not isinstance(x_timestamp_list, (list, tuple)) or not isinstance(y_timestamp_list, (list, tuple)):
             raise ValueError("df_list, x_timestamp_list, y_timestamp_list must be list or tuple types.")
         if not (len(df_list) == len(x_timestamp_list) == len(y_timestamp_list)):
@@ -647,18 +630,16 @@ class KronosPredictor:
             seq_lens.append(x_norm.shape[0])
             y_lens.append(y_stamp.shape[0])
 
-        # Require all series to have consistent historical and prediction lengths for batch processing
         if len(set(seq_lens)) != 1:
             raise ValueError(f"Parallel prediction requires all series to have consistent historical lengths, got: {seq_lens}")
         if len(set(y_lens)) != 1:
             raise ValueError(f"Parallel prediction requires all series to have consistent prediction lengths, got: {y_lens}")
 
-        x_batch = np.stack(x_list, axis=0).astype(np.float32)           # (B, seq_len, feat)
-        x_stamp_batch = np.stack(x_stamp_list, axis=0).astype(np.float32) # (B, seq_len, time_feat)
-        y_stamp_batch = np.stack(y_stamp_list, axis=0).astype(np.float32) # (B, pred_len, time_feat)
+        x_batch = np.stack(x_list, axis=0).astype(np.float32)
+        x_stamp_batch = np.stack(x_stamp_list, axis=0).astype(np.float32)
+        y_stamp_batch = np.stack(y_stamp_list, axis=0).astype(np.float32)
 
         preds = self.generate(x_batch, x_stamp_batch, y_stamp_batch, pred_len, T, top_k, top_p, sample_count, verbose)
-        # preds: (B, pred_len, feat)
 
         pred_dfs = []
         for i in range(num_series):

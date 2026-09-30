@@ -27,9 +27,6 @@ FEATURES = ['open', 'high', 'low', 'close', 'volume', 'amount']
 CLOSE_IDX = 3
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config dataclass (subset of YAML, passed into infer_symbol)
-# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class InferConfig:
     lookback: int
@@ -42,12 +39,9 @@ class InferConfig:
     top_k: int
     temperature: float
     batch_size: int
-    zero_vol_amount: bool = False  # paper: exclude vol/amount for crypto & forex
+    zero_vol_amount: bool = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Window construction
-# ─────────────────────────────────────────────────────────────────────────────
 def build_test_windows(
     timestamps: pd.Series,
     test_start_str: str,
@@ -79,9 +73,7 @@ def build_test_windows(
     ts = pd.to_datetime(timestamps).reset_index(drop=True)
     n = len(ts)
 
-    # First context_end index that lies in test period
     first_ctx_end = int(ts.searchsorted(test_start, side='left'))
-    # Last fut_end index that lies in test period
     last_fut_end = int(ts.searchsorted(test_end, side='right'))
 
     windows = []
@@ -92,9 +84,6 @@ def build_test_windows(
     return windows
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Time-stamp feature extraction (matches Kronos repo's calc_time_stamps)
-# ─────────────────────────────────────────────────────────────────────────────
 def calc_time_stamps(timestamps: pd.Series) -> pd.DataFrame:
     """
     Extract 5 time features: minute, hour, day_of_week, day_of_month, month.
@@ -111,14 +100,11 @@ def calc_time_stamps(timestamps: pd.Series) -> pd.DataFrame:
     })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core inference: rollouts for a batch of windows
-# ─────────────────────────────────────────────────────────────────────────────
 def infer_rollouts(
     tokenizer, model, sample_from_logits_fn,
-    x_norm: np.ndarray,       # (B, L, 6)
-    x_stamp: np.ndarray,      # (B, L, 5)
-    y_stamp: np.ndarray,      # (B, H, 5)
+    x_norm: np.ndarray,
+    x_stamp: np.ndarray,
+    y_stamp: np.ndarray,
     cfg: InferConfig,
     device: torch.device,
 ) -> np.ndarray:
@@ -147,9 +133,9 @@ def infer_rollouts(
 
     with torch.no_grad():
         x_tok = tokenizer.encode(x_r, half=True)
-        eff_batch = x_tok[0].size(0)  # B * N
+        eff_batch = x_tok[0].size(0)
         total_len = L + H
-        full_stamp = torch.cat([xst_r, yst_r], dim=1)  # (B*N, L+H, 5)
+        full_stamp = torch.cat([xst_r, yst_r], dim=1)
 
         gen_pre = x_tok[0].new_empty(eff_batch, H)
         gen_post = x_tok[1].new_empty(eff_batch, H)
@@ -217,9 +203,6 @@ def infer_rollouts(
     return z
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-symbol orchestrator
-# ─────────────────────────────────────────────────────────────────────────────
 def infer_symbol(
     symbol: str,
     csv_path: Path,
@@ -246,12 +229,10 @@ def infer_symbol(
     df = df.sort_values('timestamps').reset_index(drop=True)
 
     vals = df[FEATURES].values.astype(np.float32)
-    # Paper Appendix D: "For cryptocurrency and forex assets, we intentionally
-    # exclude volume and amount fields, providing only the OHLC price series."
     if cfg.zero_vol_amount:
         vals = vals.copy()
-        vals[:, 4] = 0.0  # volume
-        vals[:, 5] = 0.0  # amount
+        vals[:, 4] = 0.0
+        vals[:, 5] = 0.0
     ts = df['timestamps']
 
     windows = build_test_windows(
@@ -269,7 +250,6 @@ def infer_symbol(
             'timestamps': np.empty((0,), dtype='datetime64[ns]'),
         }
 
-    # Allocate outputs
     pred_paths = np.zeros((n_t, cfg.pred_len, 6), dtype=np.float32)
     pred_paths_per_rollout = np.zeros((n_t, cfg.n_rollouts, cfg.pred_len, 6),
                                        dtype=np.float32)
@@ -280,7 +260,6 @@ def infer_symbol(
     t0 = time.time()
     BS = cfg.batch_size
 
-    # Optional autocast for V100 (FP16, NOT bf16)
     autocast_ctx = (
         torch.amp.autocast(device_type='cuda', dtype=torch.float16)
         if use_fp16 and device.type == 'cuda'
@@ -324,16 +303,13 @@ def infer_symbol(
                 tokenizer, model, sample_fn,
                 x_norm_b, x_stamp_b, y_stamp_b, cfg, device,
             )
-        # z_norm: (B, N, L+H, 6) normalized
 
-        # Denormalize: broadcast (B,6) → (B,1,1,6)
         mu4 = x_means[:, None, None, :]
         sig4 = x_stds[:, None, None, :]
         z_den = z_norm * (sig4 + 1e-5) + mu4
 
-        # Slice to future part only (drop reconstructed history)
-        pred_future_rollouts = z_den[:, :, cfg.lookback:, :]   # (B, N, H, 6)
-        pred_future_mean = pred_future_rollouts.mean(axis=1)   # (B, H, 6)
+        pred_future_rollouts = z_den[:, :, cfg.lookback:, :]
+        pred_future_mean = pred_future_rollouts.mean(axis=1)
 
         pred_paths[b * BS:b * BS + B] = pred_future_mean
         pred_paths_per_rollout[b * BS:b * BS + B] = pred_future_rollouts

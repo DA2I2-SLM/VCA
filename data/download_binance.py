@@ -37,14 +37,12 @@ logging.basicConfig(
 )
 log = logging.getLogger('download')
 
-# Binance kline column names (full schema; we keep subset).
 KLINE_COLS = [
     'open_time', 'open', 'high', 'low', 'close', 'volume',
     'close_time', 'quote_asset_volume', 'num_trades',
     'taker_buy_base', 'taker_buy_quote', 'ignore',
 ]
 
-# Map our config frequency to Binance interval string.
 FREQ_MAP = {
     '1m':   Client.KLINE_INTERVAL_1MINUTE,
     '5m':   Client.KLINE_INTERVAL_5MINUTE,
@@ -81,16 +79,13 @@ def download_symbol(client: Client, symbol: str, interval: str,
 
     df = pd.DataFrame(klines, columns=KLINE_COLS)
 
-    # Convert types
     df['timestamps'] = pd.to_datetime(df['open_time'], unit='ms')
     for col in ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume']:
         df[col] = df[col].astype(float)
 
-    # Match Kronos schema: amount = quote_asset_volume (USDT-denominated turnover)
     df = df.rename(columns={'quote_asset_volume': 'amount'})
     df = df[['timestamps', 'open', 'high', 'low', 'close', 'volume', 'amount']]
 
-    # Sanity: drop rows with zero volume (no trades, unreliable OHLC)
     n_before = len(df)
     df = df[df['volume'] > 0].reset_index(drop=True)
     n_dropped = n_before - len(df)
@@ -122,7 +117,6 @@ def main():
     log.info(f"Downloading {len(symbols)} symbols, {cfg['frequency']}, "
              f"{start} → {end} → {data_dir}/")
 
-    # Public client (no API key needed for klines).
     client = Client(api_key='', api_secret='')
 
     results = {}
@@ -131,7 +125,6 @@ def main():
         n_rows = download_symbol(client, sym, interval, start, end, out_path)
         results[sym] = n_rows
 
-    # Summary
     log.info("\n=== Download summary ===")
     successful = [s for s, n in results.items() if n > 0]
     failed = [s for s, n in results.items() if n == 0]
@@ -140,7 +133,6 @@ def main():
         log.warning(f"  Failed:     {failed}")
     log.info(f"  Total rows: {sum(results.values()):,}")
 
-    # Save manifest
     manifest_path = data_dir / 'manifest.csv'
     pd.DataFrame([
         {'symbol': s, 'n_rows': n, 'status': 'ok' if n > 0 else 'failed'}

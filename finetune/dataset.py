@@ -89,9 +89,9 @@ class CryptoWindowDataset(Dataset):
         zero_vol_amount: bool = True,
         data_fraction: float = 1.0,
         frequency: str = '15m',
-        data_select: str = None,   # None | 'random' | 'high_acf2' | 'low_acf2': how to pick data_fraction
+        data_select: str = None,
         acf_select_lags: int = 3,
-        data_select_seed: int = 0, # rank-INDEPENDENT seed for 'random' subset (all DDP ranks must match)
+        data_select_seed: int = 0,
     ):
         self.lookback = lookback
         self.pred_len = pred_len
@@ -99,9 +99,7 @@ class CryptoWindowDataset(Dataset):
         self.zero_vol_amount = zero_vol_amount
 
         self.windows: List[Tuple[np.ndarray, np.ndarray, int, int]] = []
-        # (score, vals, ts_arr, cs, ce) staged here when data_select is set (global ranking)
         _scored: List[Tuple[float, np.ndarray, np.ndarray, int, int]] = []
-        # Each entry: (vals, ts_arr, ctx_start, ctx_end)
 
         data_dir = Path(data_dir)
         for sym in symbols:
@@ -125,8 +123,6 @@ class CryptoWindowDataset(Dataset):
                 lookback, pred_len, stride,
             )
 
-            # chronological data_fraction: only when NOT doing ACF²-based selection
-            # (selection ranks globally across all windows after the loop).
             if data_fraction < 1.0 and data_select in (None, 'first', 'last'):
                 n_keep = max(1, int(len(windows) * data_fraction))
                 windows = windows[-n_keep:] if data_select == 'last' else windows[:n_keep]
@@ -138,9 +134,9 @@ class CryptoWindowDataset(Dataset):
                 if data_select in (None, 'first', 'last'):
                     self.windows.append((vals, ts_arr, cs, ce))
                 elif data_select == 'random':
-                    _scored.append((0.0, vals, ts_arr, cs, ce))  # score unused; global shuffle below
+                    _scored.append((0.0, vals, ts_arr, cs, ce))
                 else:
-                    fut = vals[ce:fe, close_i]  # prediction target window (what the ACF² loss shapes)
+                    fut = vals[ce:fe, close_i]
                     a = acf_sq_returns(fut, acf_select_lags) if (fut > 0).all() else None
                     score = float(np.nanmean(np.abs(a))) if a is not None and np.isfinite(a).any() else -1.0
                     _scored.append((score, vals, ts_arr, cs, ce))
@@ -149,15 +145,10 @@ class CryptoWindowDataset(Dataset):
             valid = [w for w in _scored if w[0] >= 0.0]
             n_keep = max(1, int(len(valid) * data_fraction))
             if data_select == 'random':
-                # random global subset — controls for recency (unlike chronological-first) so the
-                # data-efficiency comparison isolates *quantity*. Uses a dedicated RANK-INDEPENDENT RNG
-                # (data_select_seed = cfg.seed, no +rank offset) so every DDP rank keeps the SAME subset;
-                # the global np.random state is rank-offset and would desync ranks.
                 idx = np.random.default_rng(data_select_seed).permutation(len(valid))[:n_keep]
                 keep = [valid[i] for i in idx]
                 print(f"[dataset] data_select=random: kept {n_keep}/{len(valid)} windows (frac={data_fraction})")
             else:
-                # rank by future-window ACF² strength (proxy for clustering headroom)
                 valid.sort(key=lambda w: w[0], reverse=(data_select == 'high_acf2'))
                 keep = valid[:n_keep]
                 print(f"[dataset] data_select={data_select}: kept {n_keep}/{len(valid)} "
@@ -183,8 +174,8 @@ class CryptoWindowDataset(Dataset):
         vals, ts_arr, cs, ce = self.windows[idx]
         fe = ce + self.pred_len
 
-        x_raw = vals[cs:ce]   # (L, 6)
-        y_raw = vals[ce:fe]   # (H, 6)
+        x_raw = vals[cs:ce]
+        y_raw = vals[ce:fe]
 
         mu = x_raw.mean(axis=0)
         sigma = x_raw.std(axis=0)
