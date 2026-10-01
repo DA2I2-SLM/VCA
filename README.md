@@ -248,7 +248,6 @@ VCA/
 │   ├── run_eval_baseline.sh     # frozen backbone, and optionally a checkpoint
 │   └── run_garch_har.sh         # GARCH(1,1) + HAR-RV on a config's windows
 ├── configs/                     # EVALUATION configs: {dataset}_h{H}[_chronos].yaml
-│   ├── crypto_demo.yaml         # 5-symbol slice for validate.sh
 │   ├── crypto_top20_h{8,16,32,48}.yaml
 │   ├── crypto_top20_h{16,32}_chronos.yaml
 │   ├── csi300_h{8,16,32,48}.yaml

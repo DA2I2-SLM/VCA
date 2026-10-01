@@ -102,11 +102,13 @@ class CryptoWindowDataset(Dataset):
         _scored: List[Tuple[float, np.ndarray, np.ndarray, int, int]] = []
 
         data_dir = Path(data_dir)
+        n_loaded = 0
         for sym in symbols:
             csv_path = data_dir / f"{sym.lower()}_{frequency}.csv"
             if not csv_path.exists():
                 print(f"[dataset] skip {sym}: {csv_path} not found")
                 continue
+            n_loaded += 1
 
             df = pd.read_csv(csv_path)
             df['timestamps'] = pd.to_datetime(df['timestamps'])
@@ -165,7 +167,7 @@ class CryptoWindowDataset(Dataset):
             )
 
         print(f"[dataset] {period_start}–{period_end}: {len(self.windows)} windows "
-              f"from {len(symbols)} symbols (fraction={data_fraction})")
+              f"from {n_loaded}/{len(symbols)} symbols (fraction={data_fraction})")
 
     def __len__(self) -> int:
         return len(self.windows)

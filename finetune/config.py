@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 import os
 from typing import List
 
-_SCRATCH = f'/scratch/{os.getenv("USER", "user")}/Kronos'
+_SCRATCH = os.path.expandvars(os.environ.get('VCA_SCRATCH', '/scratch/$USER/Kronos'))
 
 
 CRYPTO_TOP20 = [

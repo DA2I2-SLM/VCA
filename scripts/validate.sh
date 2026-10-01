@@ -4,16 +4,18 @@
 # download -> frozen eval -> fine-tune -> eval the checkpoint -> test-time control
 # -> classical baselines. Every step is idempotent, so a re-run resumes.
 #
-# This is NOT a paper-quality run: 5 symbols, 1 epoch, 1 GPU. Reproducing a table
-# cell needs the full universe, 10 epochs and 4 GPUs -- see scripts/run_train_vca.sh.
+# This is NOT a paper-quality run: it fine-tunes for 1 epoch on 1 GPU, where the
+# paper's cells are 10 epochs, 3 seeds and 4 GPUs -- see scripts/run_train_vca.sh.
+# Everything else is the paper's crypto H=32 setting, so the download is the full
+# 20-symbol universe and takes a while on a cold /scratch.
 #
 # Usage: bash scripts/validate.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CONFIG="configs/crypto_demo.yaml"
-CACHE="/scratch/$USER/Kronos/predictions/crypto_demo"
+CONFIG="configs/crypto_top20_h32.yaml"
+CACHE="/scratch/$USER/Kronos/predictions/crypto_top20_h32"
 CKPT_DIR="/scratch/$USER/Kronos/outputs/phase2/vca_validate"
 
 echo "== [0/6] Preflight: imports and CUDA =="
@@ -28,7 +30,7 @@ print(f'torch {torch.__version__}  cuda={torch.cuda.is_available()}  '
 assert torch.cuda.is_available(), 'validate.sh needs a GPU'
 "
 
-echo "== [1/6] Downloading demo crypto data =="
+echo "== [1/6] Downloading crypto data =="
 python data/download_binance.py --config "$CONFIG"
 
 echo "== [2/6] Frozen backbone baseline =="
@@ -54,8 +56,8 @@ cat <<'EOF'
 
 validate.sh: all steps completed.
 
-This was a plumbing check, not a result. It ran 5 symbols for 1 epoch on 1 GPU;
-the paper's cells are the full universe, 10 epochs, 3 seeds, 4 GPUs.
+This was a plumbing check, not a result. It fine-tuned for 1 epoch on 1 GPU;
+the paper's cells are 10 epochs, 3 seeds, 4 GPUs.
 
 Next steps:
   * full crypto run      -> bash scripts/run_train_vca.sh CRYPTO_A2_L10_H32

@@ -173,8 +173,8 @@ def get_predictions_dir(cfg_yaml: dict) -> Path:
     Return the root directory for cached pkl predictions.
 
     Config key `predictions_cache_dir` (optional): path where large pkl files
-    are stored. Supports `{USER}` placeholder → expanded to getpass.getuser().
-    Falls back to `{output_dir}/predictions` for backward compatibility.
+    are stored. `$USER` in it is already expanded by main() (os.path.expandvars);
+    a literal `{USER}` is also accepted. Falls back to `{output_dir}/predictions`.
     """
     raw = cfg_yaml.get('predictions_cache_dir', '')
     if raw:
